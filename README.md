@@ -20,6 +20,31 @@ export PATH="$HOME/.local/share/modman/bin:$PATH"
 
 Then open a new terminal, or run `source ~/.bashrc`, so the change takes effect.
 
+## Configuration
+
+Each modpack is a folder under `/srv/minecraft`. The folder name is the name you type in modman.
+
+`start.sh` has to be in that folder, and it has to be executable. modman runs `./start.sh` from the folder, inside a screen session. That script is what launches the Minecraft server. The mods, the server jar, and `eula.txt` stay in the pack for `start.sh` to use.
+
+`server.properties` holds the port on a `server-port=` line. `list` and `status` show that port, and the `port` command writes it. When the file or the line is missing, the port column shows `-`.
+
+When `start.sh` does not name a `java` program, modman reads `JAVA=` from `variables.txt` and uses that path for the Java version column.
+
+The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting** from **running**.
+
+`data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. Every other line is a server name. The file stays on the machine. Copy the example to create it:
+
+```bash
+cp ~/.local/share/modman/data/index.txt.example ~/.local/share/modman/data/index.txt
+```
+
+The example looks like this:
+
+```text
+Cobbleverse
+Ascendra
+```
+
 ## Start it
 
 Open a terminal and run:
@@ -34,7 +59,7 @@ The Up and Down arrow keys recall commands you have typed before. Tab finishes a
 
 ## Which servers start on boot
 
-The file `data/index.txt` is the list of servers that belong to the boot service (`mc-servers.service`). One server name per line. Servers in that list are the ones `start`, `stop`, `restart`, and `status` manage as a group. That file is local to each machine. Copy `data/index.txt.example` to `data/index.txt` to start a new list.
+Servers listed in `data/index.txt` belong to the boot service (`mc-servers.service`). `start`, `stop`, `restart`, and `status` manage that list as a group. The file format is described under Configuration.
 
 `add` and `remove` change that list. `remove` stops the server first if it is running, then takes it off the list. The server folder stays on disk.
 
