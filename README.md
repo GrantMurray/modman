@@ -1,6 +1,24 @@
 # modman
 
-`modman` is a small menu for the Minecraft servers on this machine. Each server is a folder under `/srv/minecraft`. You type commands at a prompt instead of starting and stopping them by hand.
+`modman` is a small program for managing multiple Minecraft modpacks on a single server. Each modpack is a folder under `/srv/minecraft`. You type commands at a prompt instead of managing the different modpacks by hand.
+
+## Install it
+
+Put this project folder somewhere permanent, for example `~/.local/share/modman`. The `bin` and `data` folders need to stay next to each other.
+
+Make the program executable:
+
+```bash
+chmod +x ~/.local/share/modman/bin/modman
+```
+
+Add that `bin` folder to your `PATH` so you can run `modman` from any directory. Add this line to `~/.bashrc`:
+
+```bash
+export PATH="$HOME/.local/share/modman/bin:$PATH"
+```
+
+Then open a new terminal, or run `source ~/.bashrc`, so the change takes effect.
 
 ## Start it
 
@@ -57,7 +75,7 @@ Leave the console with **Ctrl-A**, then **d**. That detaches and returns you to 
 
 ## The boot service
 
-These commands talk to `mc-servers.service`, the service that starts the indexed servers when the machine boots.
+These commands talk to `mc-servers.service`, the service that starts the indexed servers at boot.
 
 | Command | What it does |
 | --- | --- |
@@ -65,6 +83,8 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 | `service start` | Starts the service, which starts any indexed server that is not already running |
 | `service stop` | Stops every indexed server, then stops the service |
 | `service restart` | Stops the indexed servers, then restarts the service |
+| `service enable` | Enables the service so it starts at boot. Does not start servers now |
+| `service disable` | Disables the service so it does not start at boot. Does not stop servers that are already running |
 
 ## Change a server
 

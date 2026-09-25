@@ -33,6 +33,8 @@ Commands:
   service start              Start ${SYSTEMD_SERVICE} (starts missing indexed packs)
   service stop               Stop all indexed packs and ${SYSTEMD_SERVICE}
   service restart            Restart all indexed packs via ${SYSTEMD_SERVICE}
+  service enable             Enable ${SYSTEMD_SERVICE} to start at boot
+  service disable            Disable ${SYSTEMD_SERVICE} from starting at boot
   add MODPACK                Add a modpack to the index
   remove MODPACK             Stop a running pack (if needed), then remove from index
   rename OLD NEW             Rename a modpack dir and update the index if present
@@ -54,6 +56,7 @@ Examples:
   join Cobbleverse
   restart
   service restart
+  service enable
   add Ascendra
   remove Linggango
   rename MonkeyMine MonkeyMine2
@@ -913,6 +916,18 @@ service_restart() {
 	echo "$SYSTEMD_SERVICE restarted."
 }
 
+service_enable() {
+	echo "Enabling $SYSTEMD_SERVICE to start at boot..."
+	run_systemctl enable "$SYSTEMD_SERVICE"
+	echo "$SYSTEMD_SERVICE enabled. It was not started."
+}
+
+service_disable() {
+	echo "Disabling $SYSTEMD_SERVICE from starting at boot..."
+	run_systemctl disable "$SYSTEMD_SERVICE"
+	echo "$SYSTEMD_SERVICE disabled. Running packs were left up."
+}
+
 service_control() {
 	local action="${1:-}"
 	case "$action" in
@@ -928,8 +943,14 @@ service_control() {
 		restart)
 			service_restart
 			;;
+		enable)
+			service_enable
+			;;
+		disable)
+			service_disable
+			;;
 		"")
-			echo "Error: 'service' requires status, start, stop, or restart." >&2
+			echo "Error: 'service' requires status, start, stop, restart, enable, or disable." >&2
 			return 1
 			;;
 		*)
@@ -1071,7 +1092,7 @@ _repl_candidates() {
 	case "$cmd" in
 		service)
 			if ((cword == 1)); then
-				_ci_matches "$cur" status start stop restart
+				_ci_matches "$cur" status start stop restart enable disable
 			fi
 			;;
 		add)
