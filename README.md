@@ -1,6 +1,6 @@
 # modman
 
-`modman` is a small program for managing multiple Minecraft modpacks on a single server. Each modpack is a folder under `/srv/minecraft`. You type commands at a prompt instead of managing the different modpacks by hand.
+`modman` is a small program for managing multiple Minecraft modpacks on a single server. You type commands at a prompt instead of managing the different modpacks by hand.
 
 ## Install it
 
@@ -32,11 +32,7 @@ When `start.sh` does not name a `java` program, modman reads `JAVA=` from `varia
 
 The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting** from **running**.
 
-`data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. Every other line is a server name. The file stays on the machine. Copy the example to create it:
-
-```bash
-cp ~/.local/share/modman/data/index.txt.example ~/.local/share/modman/data/index.txt
-```
+`data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. Every other line is a server name. The file stays on the machine.
 
 The example looks like this:
 
