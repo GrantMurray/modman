@@ -1,0 +1,1225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+INDEX_FILE="${ROOT_DIR}/data/index.txt"
+HISTORY_FILE="${ROOT_DIR}/data/.modman_history"
+MINECRAFT_ROOT="/srv/minecraft"
+SYSTEMD_SERVICE="mc-servers.service"
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0")
+
+Interactive modpack manager for ${SYSTEMD_SERVICE} (via index.txt).
+Type commands at the prompt; type exit to leave.
+
+Status values (STATUS column only — start/stop/restart use live screen presence):
+  stopped                    No live screen session
+  starting                   Screen is up; server has not printed Done yet
+  running                    Screen is up and startup finished (Done (Xs)!)
+
+Commands:
+  list                       Show modpacks currently in the index
+  available                  Show modpack dirs under ${MINECRAFT_ROOT} not in the index
+  status [MODPACK]           Show running/stopped state (all indexed, or one pack)
+  usage [MODPACK]            Show CPU, RAM, and uptime (all indexed, or one pack)
+  start [MODPACK]            Start a stopped pack, or all stopped indexed packs
+  stop [MODPACK]             Stop a running pack, or all indexed packs
+  restart [MODPACK]          Restart a pack, or all indexed packs
+  join MODPACK               Attach to a pack's screen (detach with Ctrl-A d)
+  service status             Show ${SYSTEMD_SERVICE} status
+  service start              Start ${SYSTEMD_SERVICE} (starts missing indexed packs)
+  service stop               Stop all indexed packs and ${SYSTEMD_SERVICE}
+  service restart            Restart all indexed packs via ${SYSTEMD_SERVICE}
+  add MODPACK                Add a modpack to the index
+  remove MODPACK             Stop a running pack (if needed), then remove from index
+  rename OLD NEW             Rename a modpack dir and update the index if present
+  port MODPACK PORT          Set a modpack's server-port in server.properties
+  help                       Show this help
+  exit                       Leave the manager
+
+History:
+  Up/Down arrows             Recall previously executed commands
+  Tab                        Complete commands and modpack names
+
+Examples:
+  list
+  status
+  usage
+  usage Cobbleverse
+  start Cobbleverse
+  stop Cobbleverse
+  join Cobbleverse
+  restart
+  service restart
+  add Ascendra
+  remove Linggango
+  rename MonkeyMine MonkeyMine2
+  port Cobbleverse 25570
+EOF
+}
+
+ensure_index() {
+	touch "$INDEX_FILE"
+}
+
+read_index() {
+	ensure_index
+	mapfile -t INDEX_ENTRIES < <(grep -v '^[[:space:]]*$' "$INDEX_FILE" || true)
+}
+
+in_index() {
+	local name="$1"
+	local entry
+	for entry in "${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}"; do
+		[[ "$entry" == "$name" ]] && return 0
+	done
+	return 1
+}
+
+write_index() {
+	if ((${#INDEX_ENTRIES[@]})); then
+		printf '%s\n' "${INDEX_ENTRIES[@]}" >"$INDEX_FILE"
+	else
+		: >"$INDEX_FILE"
+	fi
+}
+
+get_port() {
+	local name="$1"
+	local props="$MINECRAFT_ROOT/$name/server.properties"
+	local port=""
+
+	if [[ -f "$props" ]]; then
+		port="$(grep -E '^[[:space:]]*server-port=' "$props" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '[:space:]')"
+	fi
+
+	if [[ -n "$port" ]]; then
+		printf '%s' "$port"
+	else
+		printf '%s' "-"
+	fi
+}
+
+# Java executable a pack's start.sh launches: a literal java command, or JAVA= from variables.txt.
+java_bin_for() {
+	local name="$1"
+	local start="$MINECRAFT_ROOT/$name/start.sh"
+	local vars="$MINECRAFT_ROOT/$name/variables.txt"
+	local bin="" line
+
+	if [[ -f "$start" ]]; then
+		line="$(grep -E '^[[:space:]]*(exec[[:space:]]+)?(/[^[:space:]]*/java|java)([[:space:]]|$)' "$start" | head -n1 || true)"
+		line="${line#"${line%%[![:space:]]*}"}"
+		if [[ "$line" == exec[[:space:]]* ]]; then
+			line="${line#exec}"
+			line="${line#"${line%%[![:space:]]*}"}"
+		fi
+		bin="${line%%[[:space:]]*}"
+	fi
+
+	if [[ -z "$bin" && -f "$vars" ]]; then
+		line="$(grep -E '^[[:space:]]*JAVA=' "$vars" | head -n1 || true)"
+		line="${line#*=}"
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		if [[ "$line" == \"*\" || "$line" == \'*\' ]]; then
+			line="${line:1:${#line}-2}"
+		fi
+		bin="$line"
+	fi
+
+	printf '%s' "$bin"
+}
+
+# Major version of the Java binary that pack would start (8, 17, 21, …), or "-".
+get_java_version() {
+	local name="$1"
+	local bin version major
+
+	bin="$(java_bin_for "$name")"
+	if [[ "$bin" != "java" && "$bin" != /*/java ]]; then
+		printf '%s' "-"
+		return 0
+	fi
+
+	if [[ ! -v JAVA_VERSION_CACHE ]]; then
+		declare -gA JAVA_VERSION_CACHE=()
+	fi
+	if [[ -v "JAVA_VERSION_CACHE[$bin]" ]]; then
+		printf '%s' "${JAVA_VERSION_CACHE[$bin]}"
+		return 0
+	fi
+
+	version="$("$bin" -version 2>&1 || true)"
+	version="$(printf '%s\n' "$version" | awk -F'"' '/version/ { print $2; exit }')"
+	if [[ "$version" == 1.* ]]; then
+		major="${version#1.}"
+		major="${major%%.*}"
+	else
+		major="${version%%.*}"
+	fi
+	if [[ ! "$major" =~ ^[0-9]+$ ]]; then
+		major="-"
+	fi
+	JAVA_VERSION_CACHE["$bin"]="$major"
+	printf '%s' "$major"
+}
+
+screen_name() {
+	printf 'mc-%s' "$1"
+}
+
+# Operational up/down check: live screen session only.
+# "starting" vs "running" is display-only (see display_status); never branch
+# control flow on boot completion — a booting pack is still "up".
+is_running() {
+	local name="$1"
+	local session
+	session="$(screen_name "$name")"
+
+	# Clean up dead screens so a crash doesn't block restart.
+	screen -wipe >/dev/null 2>&1 || true
+
+	screen -ls 2>/dev/null | grep -E "\.${session}[[:space:]]" | grep -vq 'Dead'
+}
+
+# Display helper only: Minecraft has printed Done for the current boot.
+# Not for start/stop/restart decisions — use is_running for those.
+_display_startup_complete() {
+	local name="$1"
+	local session
+	session="$(screen_name "$name")"
+	local tmp
+	tmp="$(mktemp "${TMPDIR:-/tmp}/mc-hardcopy.XXXXXX")"
+
+	# Dump current window + scrollback into an absolute path.
+	if screen -S "$session" -p 0 -X hardcopy -h "$tmp" 2>/dev/null; then
+		local i
+		for i in 1 2 3 4 5; do
+			[[ -s "$tmp" ]] && break
+			sleep 0.05
+		done
+		if grep -qE 'Done \([0-9.]+s\)!' "$tmp" 2>/dev/null; then
+			rm -f "$tmp"
+			return 0
+		fi
+	fi
+	rm -f "$tmp"
+
+	local log="$MINECRAFT_ROOT/$name/logs/latest.log"
+	[[ -f "$log" ]] || return 1
+
+	# Current boot is complete if the last Done comes after the last start line.
+	awk '
+		/Starting minecraft server version/ { ready = 0 }
+		/Done \([0-9.]+s\)!/ { ready = 1 }
+		END { exit ready ? 0 : 1 }
+	' "$log"
+}
+
+# Display-only STATUS label. Control logic must use is_running, not this.
+display_status() {
+	local name="$1"
+	if ! is_running "$name"; then
+		printf '%s' "stopped"
+	elif _display_startup_complete "$name"; then
+		printf '%s' "running"
+	else
+		printf '%s' "starting"
+	fi
+}
+
+# Color when stdout is a terminal.
+color_enabled() {
+	[[ -t 1 ]]
+}
+
+# Print a left-padded status word; red/yellow/green when color is enabled.
+print_status_cell() {
+	local status="$1"
+	local padded
+	padded="$(printf '%-8s' "$status")"
+
+	if ! color_enabled; then
+		printf '%s' "$padded"
+		return
+	fi
+
+	case "$status" in
+		stopped)
+			printf '\033[31m%s\033[0m' "$padded"
+			;;
+		starting)
+			printf '\033[33m%s\033[0m' "$padded"
+			;;
+		running)
+			printf '\033[32m%s\033[0m' "$padded"
+			;;
+		*)
+			printf '%s' "$padded"
+			;;
+	esac
+}
+
+print_pack_row() {
+	local name="$1"
+	local width="$2"
+	local with_status="${3:-0}"
+	local highlight="${4:-0}"
+	local port java left
+
+	port="$(get_port "$name")"
+	java="$(get_java_version "$name")"
+
+	if ((with_status)); then
+		left="$(printf "%-${width}s  %-4s  %-7s  " "$name" "$java" "$port")"
+		# Port conflicts: paint name/port red; status keeps its own color.
+		if ((highlight)) && color_enabled; then
+			printf '\033[31m%s\033[0m' "$left"
+		else
+			printf '%s' "$left"
+		fi
+		print_status_cell "$(display_status "$name")"
+		printf '\n'
+	else
+		left="$(printf "%-${width}s  %-4s  %s" "$name" "$java" "$port")"
+		if ((highlight)) && color_enabled; then
+			printf '\033[31m%s\033[0m\n' "$left"
+		else
+			printf '%s\n' "$left"
+		fi
+	fi
+}
+
+# Populate CONFLICT_PORTS assoc array (port -> 1) for ports used by 2+ packs.
+# Ignores missing ports ("-"). Sets CONFLICT_COUNT for set -u-safe checks.
+build_port_conflicts() {
+	unset CONFLICT_PORTS 2>/dev/null || true
+	declare -gA CONFLICT_PORTS
+	CONFLICT_COUNT=0
+	local -A counts=()
+	local name port
+
+	for name in "$@"; do
+		port="$(get_port "$name")"
+		[[ "$port" == "-" ]] && continue
+		counts["$port"]=$((${counts["$port"]:-0} + 1))
+	done
+
+	for port in "${!counts[@]}"; do
+		if ((counts["$port"] > 1)); then
+			CONFLICT_PORTS["$port"]=1
+			CONFLICT_COUNT=$((CONFLICT_COUNT + 1))
+		fi
+	done
+}
+
+port_conflicts() {
+	local port="$1"
+	[[ "$port" != "-" ]] || return 1
+	((CONFLICT_COUNT > 0)) || return 1
+	[[ -n "${CONFLICT_PORTS[$port]:-}" ]]
+}
+
+print_port_conflict_warning() {
+	((CONFLICT_COUNT > 0)) || return 0
+
+	local msg="Warning: overlapping ports detected; conflicting modpacks will not start properly."
+	if color_enabled; then
+		printf '\033[31m%s\033[0m\n' "$msg" >&2
+	else
+		printf '%s\n' "$msg" >&2
+	fi
+}
+
+# Header row plus a rule the same width, so column names stay distinct from the rows.
+print_table_header() {
+	local header="$1"
+	local dashes
+	printf '%s\n' "$header"
+	dashes="$(printf '%*s' "${#header}" '')"
+	printf '%s\n' "${dashes// /-}"
+}
+
+print_indexed_status_table() {
+	local width
+	width="$(max_name_width "${INDEX_ENTRIES[@]}")"
+	build_port_conflicts "${INDEX_ENTRIES[@]}"
+
+	print_table_header "$(printf "%-${width}s  %-4s  %-7s  %-8s" "MODPACK" "JAVA" "PORT" "STATUS")"
+	local name port highlight
+	for name in "${INDEX_ENTRIES[@]}"; do
+		port="$(get_port "$name")"
+		highlight=0
+		if port_conflicts "$port"; then
+			highlight=1
+		fi
+		print_pack_row "$name" "$width" 1 "$highlight"
+	done
+	print_port_conflict_warning
+}
+
+max_name_width() {
+	local width=0
+	local name
+	for name in "$@"; do
+		if ((${#name} > width)); then
+			width=${#name}
+		fi
+	done
+	# Keep at least as wide as the "MODPACK" header.
+	if ((width < 7)); then
+		width=7
+	fi
+	printf '%s' "$width"
+}
+
+list_index() {
+	read_index
+	if ((${#INDEX_ENTRIES[@]} == 0)); then
+		echo "Index is empty: $INDEX_FILE"
+		return 0
+	fi
+
+	echo "Indexed modpacks ($INDEX_FILE):"
+	print_indexed_status_table
+}
+
+list_available() {
+	read_index
+	local names=()
+	local dir name
+	for dir in "$MINECRAFT_ROOT"/*/; do
+		[[ -d "$dir" ]] || continue
+		name="$(basename "$dir")"
+		[[ "$name" == *.bak ]] && continue
+		if ! in_index "$name"; then
+			names+=("$name")
+		fi
+	done
+
+	if ((${#names[@]} == 0)); then
+		echo "No available modpacks outside the index."
+		return 0
+	fi
+
+	local width
+	width="$(max_name_width "${names[@]}")"
+	print_table_header "$(printf "%-${width}s  %-4s  %s" "MODPACK" "JAVA" "PORT")"
+	for name in "${names[@]}"; do
+		print_pack_row "$name" "$width"
+	done
+}
+
+add_modpack() {
+	local name="${1:-}"
+	if [[ -z "$name" ]]; then
+		echo "Error: missing modpack name." >&2
+		return 1
+	fi
+
+	local pack_dir="$MINECRAFT_ROOT/$name"
+	if [[ ! -d "$pack_dir" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if [[ ! -x "$pack_dir/start.sh" && ! -f "$pack_dir/start.sh" ]]; then
+		echo "Error: '$name' has no start.sh" >&2
+		return 1
+	fi
+
+	read_index
+	if in_index "$name"; then
+		echo "'$name' is already in the index."
+		return 0
+	fi
+
+	INDEX_ENTRIES+=("$name")
+	write_index
+	echo "Added '$name' to $INDEX_FILE"
+}
+
+remove_modpack() {
+	local name="${1:-}"
+	if [[ -z "$name" ]]; then
+		echo "Error: missing modpack name." >&2
+		return 1
+	fi
+
+	read_index
+	if ! in_index "$name"; then
+		echo "Error: '$name' is not in the index." >&2
+		return 1
+	fi
+
+	# Stop before dropping from the index so the pack is not left orphaned.
+	if is_running "$name"; then
+		stop_one "$name" || return 1
+	fi
+
+	local updated=()
+	local entry
+	for entry in "${INDEX_ENTRIES[@]}"; do
+		[[ "$entry" == "$name" ]] && continue
+		updated+=("$entry")
+	done
+	INDEX_ENTRIES=("${updated[@]+"${updated[@]}"}")
+	write_index
+	echo "Removed '$name' from $INDEX_FILE"
+}
+
+valid_modpack_name() {
+	local name="$1"
+	# Directory basename only: no empty, path, or relative-segment names.
+	[[ -n "$name" ]] || return 1
+	[[ "$name" != "." && "$name" != ".." ]] || return 1
+	[[ "$name" != */* && "$name" != *\\* ]] || return 1
+	return 0
+}
+
+rename_modpack() {
+	local old="${1:-}"
+	local new="${2:-}"
+
+	if [[ -z "$old" || -z "$new" ]]; then
+		echo "Error: rename requires OLD and NEW names." >&2
+		return 1
+	fi
+
+	if ! valid_modpack_name "$old" || ! valid_modpack_name "$new"; then
+		echo "Error: modpack names must be plain directory names (no path components)." >&2
+		return 1
+	fi
+
+	if [[ "$old" == "$new" ]]; then
+		echo "'$old' is already named '$new'."
+		return 0
+	fi
+
+	local old_dir="$MINECRAFT_ROOT/$old"
+	local new_dir="$MINECRAFT_ROOT/$new"
+
+	if [[ ! -d "$old_dir" ]]; then
+		echo "Error: '$old' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if [[ -e "$new_dir" ]]; then
+		echo "Error: '$new' already exists under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+
+	read_index
+	if in_index "$new"; then
+		echo "Error: '$new' is already in the index." >&2
+		return 1
+	fi
+
+	local was_running=0
+	if is_running "$old"; then
+		was_running=1
+		stop_one "$old" || return 1
+	fi
+
+	if ! mv "$old_dir" "$new_dir"; then
+		echo "Error: failed to rename '$old' to '$new' (permission denied?)." >&2
+		# Best-effort restart under the old name if we stopped it.
+		if ((was_running)); then
+			start_one "$old" || true
+		fi
+		return 1
+	fi
+
+	local indexed=0
+	if in_index "$old"; then
+		indexed=1
+		local updated=()
+		local entry
+		for entry in "${INDEX_ENTRIES[@]}"; do
+			if [[ "$entry" == "$old" ]]; then
+				updated+=("$new")
+			else
+				updated+=("$entry")
+			fi
+		done
+		INDEX_ENTRIES=("${updated[@]}")
+		write_index
+	fi
+
+	if ((indexed)); then
+		echo "Renamed '$old' to '$new' and updated $INDEX_FILE"
+	else
+		echo "Renamed '$old' to '$new' (not in index)"
+	fi
+
+	if ((was_running)); then
+		start_one "$new" || return 1
+	fi
+}
+
+set_port() {
+	local name="${1:-}"
+	local port="${2:-}"
+
+	if [[ -z "$name" || -z "$port" ]]; then
+		echo "Error: port requires MODPACK and PORT." >&2
+		return 1
+	fi
+
+	local pack_dir="$MINECRAFT_ROOT/$name"
+	if [[ ! -d "$pack_dir" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+
+	if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+		echo "Error: port must be an integer between 1 and 65535." >&2
+		return 1
+	fi
+
+	local props="$pack_dir/server.properties"
+	local old_port
+	old_port="$(get_port "$name")"
+
+	if [[ -f "$props" ]] && grep -qE '^[[:space:]]*server-port=' "$props"; then
+		local tmp
+		tmp="$(mktemp)"
+		sed -E "s/^[[:space:]]*server-port=.*/server-port=${port}/" "$props" >"$tmp"
+		if ! cat "$tmp" >"$props"; then
+			rm -f "$tmp"
+			echo "Error: failed to write $props (permission denied?)." >&2
+			return 1
+		fi
+		rm -f "$tmp"
+	else
+		if ! printf 'server-port=%s\n' "$port" >>"$props"; then
+			echo "Error: failed to write $props (permission denied?)." >&2
+			return 1
+		fi
+	fi
+
+	if [[ "$old_port" == "-" ]]; then
+		echo "Set '$name' server-port to $port ($props)"
+	else
+		echo "Changed '$name' server-port from $old_port to $port ($props)"
+	fi
+}
+
+show_status() {
+	local name="${1:-}"
+
+	if [[ -n "$name" ]]; then
+		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+			return 1
+		fi
+		local width
+		width="$(max_name_width "$name")"
+		print_table_header "$(printf "%-${width}s  %-4s  %-7s  %-8s" "MODPACK" "JAVA" "PORT" "STATUS")"
+		print_pack_row "$name" "$width" 1
+		return 0
+	fi
+
+	read_index
+	if ((${#INDEX_ENTRIES[@]} == 0)); then
+		echo "Index is empty: $INDEX_FILE"
+		return 0
+	fi
+
+	print_indexed_status_table
+}
+
+format_ram_kb() {
+	local kb="$1"
+	local tenths
+	tenths=$((kb * 10 / 1048576))
+	printf '%d.%d GB' $((tenths / 10)) $((tenths % 10))
+}
+
+format_elapsed() {
+	local etime="$1"
+	local days=0 hours=0 mins=0 secs=0
+	local a b c
+
+	if [[ "$etime" == *-* ]]; then
+		days="${etime%%-*}"
+		etime="${etime#*-}"
+	fi
+	IFS=: read -r a b c <<<"$etime"
+	if [[ -z "${c:-}" ]]; then
+		mins=$((10#$a))
+		secs=$((10#$b))
+	else
+		hours=$((10#$a))
+		mins=$((10#$b))
+		secs=$((10#$c))
+	fi
+
+	if ((days > 0)); then
+		printf '%dd %dh' "$days" "$hours"
+	elif ((hours > 0)); then
+		printf '%dh %dm' "$hours" "$mins"
+	elif ((mins > 0)); then
+		printf '%d min' "$mins"
+	else
+		printf '%ds' "$secs"
+	fi
+}
+
+# CPU, RAM, and uptime of the pack's Java process. "-" when it is not running.
+pack_usage_cells() {
+	local name="$1"
+	local pack_dir="$MINECRAFT_ROOT/$name"
+	local pid cwd comm stats pcpu rss etime
+
+	for pid in /proc/[0-9]*; do
+		pid="${pid#/proc/}"
+		cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+		[[ "$cwd" == "$pack_dir" ]] || continue
+		comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+		[[ "$comm" == "java" ]] || continue
+		stats="$(ps -p "$pid" -o pcpu=,rss=,etime= 2>/dev/null || true)"
+		[[ -n "$stats" ]] || continue
+		read -r pcpu rss etime <<<"$stats"
+		printf '%s\n' "$(printf '%.1f%%' "$pcpu")"
+		printf '%s\n' "$(format_ram_kb "$rss")"
+		printf '%s\n' "$(format_elapsed "$etime")"
+		return 0
+	done
+
+	printf '%s\n' "-" "-" "-"
+}
+
+print_usage_table() {
+	local width
+	width="$(max_name_width "$@")"
+	print_table_header "$(printf "%-${width}s  %-6s  %-8s  %s" "MODPACK" "CPU" "RAM" "UPTIME")"
+	local name cpu ram uptime
+	for name in "$@"; do
+		{
+			read -r cpu
+			read -r ram
+			read -r uptime
+		} < <(pack_usage_cells "$name")
+		printf "%-${width}s  %-6s  %-8s  %s\n" "$name" "$cpu" "$ram" "$uptime"
+	done
+}
+
+show_usage() {
+	local name="${1:-}"
+
+	if [[ -n "$name" ]]; then
+		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+			return 1
+		fi
+		print_usage_table "$name"
+		return 0
+	fi
+
+	read_index
+	if ((${#INDEX_ENTRIES[@]} == 0)); then
+		echo "Index is empty: $INDEX_FILE"
+		return 0
+	fi
+
+	print_usage_table "${INDEX_ENTRIES[@]}"
+}
+
+start_one() {
+	local name="$1"
+	local pack_dir="$MINECRAFT_ROOT/$name"
+	local session
+	session="$(screen_name "$name")"
+
+	if [[ ! -d "$pack_dir" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if [[ ! -f "$pack_dir/start.sh" ]]; then
+		echo "Error: '$name' has no start.sh" >&2
+		return 1
+	fi
+
+	if is_running "$name"; then
+		echo "'$name' is already running (screen $session)."
+		return 0
+	fi
+
+	screen -dmS "$session" bash -c "cd \"$pack_dir\" && ./start.sh"
+	echo "Started '$name' in screen $session."
+}
+
+start_servers() {
+	local name="${1:-}"
+
+	if [[ -n "$name" ]]; then
+		start_one "$name"
+		return
+	fi
+
+	read_index
+	if ((${#INDEX_ENTRIES[@]} == 0)); then
+		echo "Index is empty: $INDEX_FILE"
+		return 0
+	fi
+
+	local started=0
+	local skipped=0
+	local entry
+	for entry in "${INDEX_ENTRIES[@]}"; do
+		if is_running "$entry"; then
+			echo "Skipping '$entry' (already running)."
+			skipped=$((skipped + 1))
+			continue
+		fi
+		start_one "$entry" || return 1
+		started=$((started + 1))
+	done
+
+	echo "Done. Started $started, already running $skipped."
+}
+
+stop_one() {
+	local name="$1"
+	local session
+	session="$(screen_name "$name")"
+
+	screen -wipe >/dev/null 2>&1 || true
+
+	if ! is_running "$name"; then
+		echo "'$name' is not running."
+		return 0
+	fi
+
+	if screen -S "$session" -X quit >/dev/null 2>&1; then
+		echo "Stopped '$name' (screen $session)."
+	else
+		echo "Error: failed to stop screen $session." >&2
+		return 1
+	fi
+}
+
+join_screen() {
+	local name="${1:-}"
+	local session
+
+	if [[ -z "$name" ]]; then
+		echo "Error: missing modpack name." >&2
+		return 1
+	fi
+	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if ! is_running "$name"; then
+		echo "Error: '$name' is not running." >&2
+		return 1
+	fi
+
+	session="$(screen_name "$name")"
+	echo "Attaching to screen $session. Detach with Ctrl-A d to return here."
+	sleep 1.5
+	# Reattach if detached; if another client already has it, share the session.
+	if ! screen -r "$session"; then
+		screen -x "$session" || {
+			echo "Error: failed to attach to screen $session." >&2
+			return 1
+		}
+	fi
+}
+
+stop_servers() {
+	local name="${1:-}"
+
+	if [[ -n "$name" ]]; then
+		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+			return 1
+		fi
+		stop_one "$name"
+		return
+	fi
+
+	read_index
+	if ((${#INDEX_ENTRIES[@]} == 0)); then
+		echo "Index is empty: $INDEX_FILE"
+		return 0
+	fi
+
+	local entry
+	for entry in "${INDEX_ENTRIES[@]}"; do
+		stop_one "$entry" || return 1
+	done
+}
+
+restart_servers() {
+	local name="${1:-}"
+
+	if [[ -n "$name" ]]; then
+		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+			return 1
+		fi
+		stop_one "$name" || return 1
+		sleep 1
+		start_one "$name"
+		return
+	fi
+
+	stop_servers || return 1
+	sleep 1
+	start_servers
+}
+
+run_systemctl() {
+	local -a args=("$@")
+	if systemctl "${args[@]}" 2>/dev/null; then
+		return 0
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		sudo systemctl "${args[@]}"
+		return
+	fi
+	echo "Error: systemctl failed and sudo is unavailable." >&2
+	return 1
+}
+
+service_status() {
+	run_systemctl --no-pager --full status "$SYSTEMD_SERVICE" || true
+}
+
+service_start() {
+	echo "Starting $SYSTEMD_SERVICE..."
+	run_systemctl start "$SYSTEMD_SERVICE"
+	echo "$SYSTEMD_SERVICE start requested."
+}
+
+service_stop() {
+	echo "Stopping indexed packs and $SYSTEMD_SERVICE..."
+	# Unit has no ExecStop; quit screens first so servers actually halt.
+	stop_servers || return 1
+	run_systemctl stop "$SYSTEMD_SERVICE"
+	echo "$SYSTEMD_SERVICE stopped."
+}
+
+service_restart() {
+	echo "Restarting indexed packs via $SYSTEMD_SERVICE..."
+	stop_servers || return 1
+	sleep 1
+	run_systemctl restart "$SYSTEMD_SERVICE"
+	echo "$SYSTEMD_SERVICE restarted."
+}
+
+service_control() {
+	local action="${1:-}"
+	case "$action" in
+		status)
+			service_status
+			;;
+		start)
+			service_start
+			;;
+		stop)
+			service_stop
+			;;
+		restart)
+			service_restart
+			;;
+		"")
+			echo "Error: 'service' requires status, start, stop, or restart." >&2
+			return 1
+			;;
+		*)
+			echo "Error: unknown service action '$action'." >&2
+			return 1
+			;;
+	esac
+}
+
+require_arg() {
+	local cmd="$1"
+	local value="${2:-}"
+	if [[ -z "$value" ]]; then
+		echo "Error: '$cmd' requires a modpack name." >&2
+		return 1
+	fi
+}
+
+require_two_args() {
+	local cmd="$1"
+	local first="${2:-}"
+	local second="${3:-}"
+	if [[ -z "$first" || -z "$second" ]]; then
+		echo "Error: '$cmd' requires two arguments." >&2
+		return 1
+	fi
+}
+
+# Returns 2 for exit so the REPL can leave; 0 on success; 1 on error.
+dispatch() {
+	if (($# == 0)); then
+		return 0
+	fi
+
+	local cmd="$1"
+	shift
+
+	case "$cmd" in
+		exit)
+			return 2
+			;;
+		help)
+			usage
+			;;
+		list)
+			list_index
+			;;
+		available)
+			list_available
+			;;
+		status)
+			show_status "${1:-}" || return 1
+			;;
+		usage)
+			show_usage "${1:-}" || return 1
+			;;
+		start)
+			start_servers "${1:-}" || return 1
+			;;
+		stop)
+			stop_servers "${1:-}" || return 1
+			;;
+		restart)
+			restart_servers "${1:-}" || return 1
+			;;
+		join)
+			require_arg "$cmd" "${1:-}" || return 1
+			join_screen "$1" || return 1
+			;;
+		service)
+			service_control "${1:-}" || return 1
+			;;
+		add)
+			require_arg "$cmd" "${1:-}" || return 1
+			add_modpack "$1" || return 1
+			;;
+		remove|rm)
+			require_arg "$cmd" "${1:-}" || return 1
+			remove_modpack "$1" || return 1
+			;;
+		rename|mv)
+			require_two_args "$cmd" "${1:-}" "${2:-}" || return 1
+			rename_modpack "$1" "$2" || return 1
+			;;
+		port)
+			require_two_args "$cmd" "${1:-}" "${2:-}" || return 1
+			set_port "$1" "$2" || return 1
+			;;
+		*)
+			echo "Error: unknown command '$cmd'. Type help for commands." >&2
+			return 1
+			;;
+	esac
+}
+
+all_modpack_names() {
+	local dir name
+	for dir in "$MINECRAFT_ROOT"/*/; do
+		[[ -d "$dir" ]] || continue
+		name="$(basename "$dir")"
+		[[ "$name" == *.bak ]] && continue
+		printf '%s\n' "$name"
+	done
+}
+
+available_modpack_names() {
+	read_index
+	local name
+	while IFS= read -r name; do
+		[[ -n "$name" ]] || continue
+		in_index "$name" && continue
+		printf '%s\n' "$name"
+	done < <(all_modpack_names)
+}
+
+# Tab completion for read -e. Programmable `complete -F` does not run under
+# read -e, so we bind Tab to a handler that edits READLINE_LINE / READLINE_POINT.
+_ci_matches() {
+	local cur="$1"
+	local word
+	shift
+	for word in "$@"; do
+		[[ -n "$word" ]] || continue
+		[[ "${word,,}" == "${cur,,}"* ]] && printf '%s\n' "$word"
+	done
+}
+
+_repl_candidates() {
+	local cmd="$1"
+	local cword="$2"
+	local cur="$3"
+	local -a words=()
+
+	if ((cword == 0)); then
+		_ci_matches "$cur" list available status usage start stop restart join service add remove rm rename mv port help exit
+		return 0
+	fi
+
+	case "$cmd" in
+		service)
+			if ((cword == 1)); then
+				_ci_matches "$cur" status start stop restart
+			fi
+			;;
+		add)
+			if ((cword == 1)); then
+				mapfile -t words < <(available_modpack_names || true)
+				_ci_matches "$cur" ${words[@]+"${words[@]}"}
+			fi
+			;;
+		remove|rm)
+			if ((cword == 1)); then
+				read_index
+				_ci_matches "$cur" ${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}
+			fi
+			;;
+		rename|mv|port)
+			if ((cword == 1)); then
+				mapfile -t words < <(all_modpack_names || true)
+				_ci_matches "$cur" ${words[@]+"${words[@]}"}
+			fi
+			;;
+		status|usage|start|stop|restart|join)
+			if ((cword == 1)); then
+				read_index
+				_ci_matches "$cur" ${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}
+			fi
+			;;
+	esac
+	return 0
+}
+
+_repl_common_prefix() {
+	local prefix="$1"
+	local word
+	shift
+	for word in "$@"; do
+		while [[ "$word" != "$prefix"* ]]; do
+			prefix="${prefix%?}"
+			[[ -z "$prefix" ]] && break
+		done
+	done
+	printf '%s' "$prefix"
+}
+
+_repl_tab_complete() {
+	local line="${READLINE_LINE-}"
+	local point="${READLINE_POINT-0}"
+	local before="${line:0:point}"
+	local after="${line:point}"
+	local -a words=()
+	local cur="" cword=0
+
+	# shellcheck disable=SC2206
+	words=($before)
+	if [[ -z "$before" || "$before" =~ [[:space:]]$ ]]; then
+		cur=""
+		cword=${#words[@]}
+	else
+		cur="${words[-1]}"
+		cword=$((${#words[@]} - 1))
+	fi
+
+	local cmd="${words[0]-}"
+	local -a matches=()
+	mapfile -t matches < <(_repl_candidates "$cmd" "$cword" "$cur")
+	((${#matches[@]})) || return 0
+
+	local completed
+	if ((${#matches[@]} == 1)); then
+		completed="${matches[0]} "
+	else
+		local -a lower=()
+		local m prefix
+		for m in "${matches[@]}"; do
+			lower+=("${m,,}")
+		done
+		prefix="$(_repl_common_prefix "${lower[0]}" "${lower[@]:1}")"
+		completed="${matches[0]:0:${#prefix}}"
+		if [[ -z "$prefix" || "${completed,,}" == "${cur,,}" ]]; then
+			# List matches; readline redisplays the prompt/line after bind -x.
+			printf '\n%s\n' "${matches[*]}"
+			return 0
+		fi
+	fi
+
+	local prefix_before="$before"
+	if [[ -n "$cur" ]]; then
+		prefix_before="${before:0:$((${#before} - ${#cur}))}"
+	fi
+	READLINE_LINE="${prefix_before}${completed}${after}"
+	READLINE_POINT=$((${#prefix_before} + ${#completed}))
+}
+
+setup_repl_completion() {
+	bind -x '"\t": _repl_tab_complete' 2>/dev/null || true
+}
+
+repl() {
+	echo "Modpack manager. Type help for commands, exit to leave."
+	local line
+	local -a args
+
+	# Enable readline history for up/down arrow recall across sessions.
+	set -o history
+	HISTFILE="$HISTORY_FILE"
+	HISTSIZE=1000
+	HISTFILESIZE=1000
+	HISTCONTROL=ignoredups
+	history -r "$HISTFILE" 2>/dev/null || true
+	setup_repl_completion
+
+	while true; do
+		if ! read -r -e -p "modman> " line; then
+			echo
+			echo "Bye."
+			history -w "$HISTFILE" 2>/dev/null || true
+			break
+		fi
+
+		# Trim surrounding whitespace.
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[[ -z "$line" ]] && continue
+
+		history -s "$line"
+		history -a "$HISTFILE" 2>/dev/null || true
+
+		# shellcheck disable=SC2206
+		args=($line)
+		set +e
+		dispatch "${args[@]}"
+		local status=$?
+		set -e
+
+		if ((status == 2)); then
+			echo "Bye."
+			history -w "$HISTFILE" 2>/dev/null || true
+			break
+		fi
+	done
+}
+
+main() {
+	if (($# > 0)); then
+		echo "Error: this script is interactive. Run it with no arguments, then type commands at the prompt." >&2
+		echo "Example: $(basename "$0")" >&2
+		exit 1
+	fi
+	repl
+}
+
+main "$@"
