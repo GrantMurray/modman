@@ -34,7 +34,7 @@ The Up and Down arrow keys recall commands you have typed before. Tab finishes a
 
 ## Which servers start on boot
 
-The file `data/index.txt` is the list of servers that belong to the boot service (`mc-servers.service`). One server name per line. Servers in that list are the ones `start`, `stop`, `restart`, and `status` manage as a group.
+The file `data/index.txt` is the list of servers that belong to the boot service (`mc-servers.service`). One server name per line. Servers in that list are the ones `start`, `stop`, `restart`, and `status` manage as a group. That file is local to each machine. Copy `data/index.txt.example` to `data/index.txt` to start a new list.
 
 `add` and `remove` change that list. `remove` stops the server first if it is running, then takes it off the list. The server folder stays on disk.
 
