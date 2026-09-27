@@ -59,6 +59,8 @@ Servers listed in `data/index.txt` belong to the boot service (`mc-servers.servi
 
 `add` and `remove` change that list. `remove` stops the server first if it is running, then takes it off the list. The server folder stays on disk.
 
+If you have not already, add boot service `mc-servers.service` to your system using `service install`, and enable it using `service enable`, this allows servers to persist through system reboots.
+
 ## See what is going on
 
 | Command | What it shows |
