@@ -7,6 +7,8 @@ INDEX_FILE="${ROOT_DIR}/data/index.txt"
 HISTORY_FILE="${ROOT_DIR}/data/.modman_history"
 MINECRAFT_ROOT="/srv/minecraft"
 SYSTEMD_SERVICE="mc-servers.service"
+SYSTEMD_UNIT="/etc/systemd/system/${SYSTEMD_SERVICE}"
+SYSTEMD_HELPER="/usr/local/bin/start_mc_servers.sh"
 
 usage() {
 	cat <<EOF
@@ -35,6 +37,7 @@ Commands:
   service restart            Restart all indexed packs via ${SYSTEMD_SERVICE}
   service enable             Enable ${SYSTEMD_SERVICE} to start at boot
   service disable            Disable ${SYSTEMD_SERVICE} from starting at boot
+  service install            Install ${SYSTEMD_SERVICE} to run as the current user
   add MODPACK                Add a modpack to the index
   remove MODPACK             Stop a running pack (if needed), then remove from index
   rename OLD NEW             Rename a modpack dir and update the index if present
@@ -57,6 +60,7 @@ Examples:
   restart
   service restart
   service enable
+  service install
   add Ascendra
   remove Linggango
   rename MonkeyMine MonkeyMine2
@@ -928,6 +932,106 @@ service_disable() {
 	echo "$SYSTEMD_SERVICE disabled. Running packs were left up."
 }
 
+# systemd refuses User= that is not a real account name.
+service_user() {
+	local user="${SUDO_USER:-${USER:-}}"
+	if [[ -z "$user" || "$user" == "root" ]]; then
+		user="$(id -un)"
+	fi
+	if [[ -z "$user" || "$user" == "root" ]]; then
+		echo "Error: refusing to install $SYSTEMD_SERVICE as root. Run modman as the account that owns the modpacks." >&2
+		return 1
+	fi
+	if ! id "$user" >/dev/null 2>&1; then
+		echo "Error: user '$user' does not exist." >&2
+		return 1
+	fi
+	printf '%s' "$user"
+}
+
+# Copy a unit or helper into place, using sudo when the destination is not writable.
+install_system_file() {
+	local src="$1"
+	local dest="$2"
+	local dest_dir
+	dest_dir="$(dirname "$dest")"
+
+	if [[ -w "$dest_dir" ]] && { [[ ! -e "$dest" ]] || [[ -w "$dest" ]]; }; then
+		cp "$src" "$dest"
+		return
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		sudo cp "$src" "$dest"
+		return
+	fi
+	echo "Error: cannot write $dest and sudo is unavailable." >&2
+	return 1
+}
+
+service_install() {
+	local user helper_src helper_tmp unit_tmp
+	user="$(service_user)" || return 1
+
+	if [[ ! -d "$MINECRAFT_ROOT" ]]; then
+		echo "Error: modpack root not found: $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if ! command -v screen >/dev/null 2>&1; then
+		echo "Error: screen is not installed." >&2
+		return 1
+	fi
+	if ! command -v systemctl >/dev/null 2>&1; then
+		echo "Error: systemctl is not available." >&2
+		return 1
+	fi
+
+	helper_src="${SCRIPT_DIR}/start_mc_servers.sh"
+	if [[ ! -f "$helper_src" ]]; then
+		echo "Error: missing helper script: $helper_src" >&2
+		return 1
+	fi
+
+	echo "Installing $SYSTEMD_SERVICE for user $user..."
+
+	helper_tmp="$(mktemp "${TMPDIR:-/tmp}/start_mc_servers.XXXXXX")"
+	unit_tmp="$(mktemp "${TMPDIR:-/tmp}/mc-servers.service.XXXXXX")"
+	# shellcheck disable=SC2064
+	trap "rm -f $(printf '%q' "$helper_tmp") $(printf '%q' "$unit_tmp")" RETURN
+
+	sed \
+		-e "s|__INDEX_FILE__|${INDEX_FILE}|g" \
+		-e "s|__MINECRAFT_ROOT__|${MINECRAFT_ROOT}|g" \
+		"$helper_src" >"$helper_tmp"
+	chmod 755 "$helper_tmp"
+
+	cat >"$unit_tmp" <<EOF
+[Unit]
+Description=Start minecraft servers in seperate screens
+After=network.target
+
+[Service]
+Type=forking
+User=${user}
+ExecStart=${SYSTEMD_HELPER}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+	if ! install_system_file "$helper_tmp" "$SYSTEMD_HELPER"; then
+		return 1
+	fi
+	if ! install_system_file "$unit_tmp" "$SYSTEMD_UNIT"; then
+		return 1
+	fi
+
+	echo "Installed $SYSTEMD_UNIT (User=$user)."
+	echo "Installed $SYSTEMD_HELPER."
+	run_systemctl daemon-reload
+	echo "$SYSTEMD_SERVICE installed. It was not enabled or started."
+	echo "Run 'service enable' to start it at boot, or 'service start' to start it now."
+}
+
 service_control() {
 	local action="${1:-}"
 	case "$action" in
@@ -949,8 +1053,11 @@ service_control() {
 		disable)
 			service_disable
 			;;
+		install)
+			service_install
+			;;
 		"")
-			echo "Error: 'service' requires status, start, stop, restart, enable, or disable." >&2
+			echo "Error: 'service' requires status, start, stop, restart, enable, disable, or install." >&2
 			return 1
 			;;
 		*)
@@ -1092,7 +1199,7 @@ _repl_candidates() {
 	case "$cmd" in
 		service)
 			if ((cword == 1)); then
-				_ci_matches "$cur" status start stop restart enable disable
+				_ci_matches "$cur" status start stop restart enable disable install
 			fi
 			;;
 		add)

@@ -106,6 +106,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 | `service restart` | Stops the indexed servers, then restarts the service |
 | `service enable` | Enables the service so it starts at boot. Does not start servers now |
 | `service disable` | Disables the service so it does not start at boot. Does not stop servers that are already running |
+| `service install` | Installs `mc-servers.service` so it runs as the user who launched modman. Does not enable or start it |
 
 ## Change a server
 
