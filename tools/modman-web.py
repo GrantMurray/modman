@@ -262,8 +262,16 @@ APP_PAGE = r"""<!DOCTYPE html>
   .stopped { color: #8d1d1d; }
   .starting { color: #8a5a00; }
   .running { color: #1d7a3a; }
+  .error { color: #9a3412; }
   .actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
   .actions input[type="number"] { width: 5.5rem; font: inherit; padding: 0.2rem; }
+  tr.busy { color: #8a8478; }
+  tr.busy .status { color: #8a8478; }
+  tr.busy button, tr.busy input { opacity: 0.45; }
+  .loadbar { flex: 1 0 100%; height: 0.3rem; background: #e4dfd4; overflow: hidden; border-radius: 999px; }
+  .loadbar[hidden] { display: none; }
+  .loadbar span { display: block; height: 100%; width: 35%; background: #6d7a72; animation: loadbar 1s ease-in-out infinite; }
+  @keyframes loadbar { from { transform: translateX(-120%); } to { transform: translateX(320%); } }
   .danger { color: #8d1d1d; border-color: #e0b4b4; }
   .console-head { display: flex; align-items: center; gap: 0.45rem; margin: 1.2rem 0 0.4rem; }
   .console-head h2 { margin: 0; }
@@ -324,21 +332,42 @@ APP_PAGE = r"""<!DOCTYPE html>
     <span id="console-spin" class="spinner" hidden role="status" aria-label="Loading"></span>
   </div>
   <form id="console-form" class="console-form">
-    <select id="console-pack" aria-label="Modpack"></select>
+    <select id="console-pack" aria-label="Modpack">
+      <option value="">Actions</option>
+    </select>
     <input id="console-cmd" type="text" maxlength="300" placeholder="Command" autocomplete="off">
     <button type="submit">Send</button>
   </form>
   <p id="console-msg" class="muted"></p>
-  <pre id="out">Loading…</pre>
+  <pre id="out"></pre>
+  <script>
+  (function () {
+    try {
+      var saved = JSON.parse(localStorage.getItem("modman-page") || "");
+      if (!saved) return;
+      if (saved.packsHtml) document.getElementById("packs").innerHTML = saved.packsHtml;
+      if (typeof saved.consoleText === "string") document.getElementById("out").textContent = saved.consoleText;
+      var svc = saved.service || {};
+      var active = document.getElementById("svc-dot");
+      var boot = document.getElementById("boot-dot");
+      if (active && svc.active) active.classList.toggle("on", svc.active === "active");
+      if (boot && svc.enabled) boot.classList.toggle("on", svc.enabled === "enabled");
+    } catch (err) {}
+  })();
+  </script>
 </main>
 <dialog id="dlg"></dialog>
 <script>
 const out = document.getElementById("out");
 const dlg = document.getElementById("dlg");
 let hold = false;
+let rowBusy = false;
+let packsBusy = false;
+let logBusy = false;
 let packs = [];
 let searchAbort = null;
-let consoleName = "";
+let consoleName = null;
+let actionText = "";
 let consoleOffset = 0;
 let consoleBusy = false;
 let consoleTicket = 0;
@@ -367,20 +396,52 @@ async function api(path, body, signal) {
 }
 
 function show(text) {
-  out.textContent = text || "";
+  actionText = text || "";
+  consoleName = "";
+  consoleOffset = 0;
+  const sel = document.getElementById("console-pack");
+  if ([...sel.options].some((opt) => opt.value === "")) sel.value = "";
+  out.textContent = actionText;
+  if (!consoleBusy) {
+    document.getElementById("console-cmd").disabled = true;
+    document.querySelector("#console-form button[type=submit]").disabled = true;
+  }
+  saveState();
 }
 
-async function run(payload, label) {
+function setServerBusy(name, on) {
+  rowBusy = on;
+  document.querySelectorAll("#packs tr").forEach((tr) => {
+    const mine = on && tr.dataset.name === name;
+    tr.classList.toggle("busy", mine);
+    for (const el of tr.querySelectorAll("button, input")) el.disabled = on;
+    const bar = tr.querySelector(".loadbar");
+    if (bar) bar.hidden = !mine;
+  });
+}
+
+async function finishServer(name, label, request) {
+  if (rowBusy) return;
   hold = true;
+  if (name) setServerBusy(name, true);
+  else rowBusy = true;
   show(label || "Working…");
   try {
-    const data = await api("/api/run", payload);
+    const data = await request();
     if (!data) return;
     show(data.output || (data.ok ? "Done." : "Failed."));
+  } catch {
+    show("The page could not reach the server.");
   } finally {
+    if (name) setServerBusy(name, false);
+    else rowBusy = false;
     hold = false;
     loadPacks();
   }
+}
+
+async function run(payload, label) {
+  await finishServer(payload.name || "", label, () => api("/api/run", payload));
 }
 
 function ask(html, onok) {
@@ -429,6 +490,11 @@ function row(pack) {
   const indexBtn = pack.indexed
     ? `<button type="button" data-act="disable">Disable</button>`
     : `<button type="button" data-act="enable">Enable</button>`;
+  const runBtns = pack.indexed
+    ? `<button type="button" data-act="start">Start</button>
+      <button type="button" data-act="stop">Stop</button>
+      <button type="button" data-act="restart">Restart</button>`
+    : "";
   return `<tr data-name="${esc(pack.name)}">
     <td>${esc(pack.name)}</td>
     <td>${esc(pack.java)}</td>
@@ -438,12 +504,11 @@ function row(pack) {
     <td>${esc(pack.ram)}</td>
     <td>${esc(pack.uptime)}</td>
     <td class="actions">
-      <button type="button" data-act="start">Start</button>
-      <button type="button" data-act="stop">Stop</button>
-      <button type="button" data-act="restart">Restart</button>
+      ${runBtns}
       ${indexBtn}
       <button type="button" data-act="update">Update</button>
       <button type="button" class="danger" data-act="uninstall">Uninstall</button>
+      <span class="loadbar" hidden role="progressbar" aria-label="Working"><span></span></span>
     </td>
   </tr>`;
 }
@@ -470,6 +535,87 @@ function render() {
     table("Active", indexed) + table("Installed", other);
 }
 
+function saveState() {
+  try {
+    if (out.textContent === "Loading…") return;
+    const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 48;
+    localStorage.setItem("modman-page", JSON.stringify({
+      packs,
+      service: {
+        active: document.getElementById("svc-dot").getAttribute("aria-label"),
+        enabled: document.getElementById("boot-dot").getAttribute("aria-label")
+      },
+      consoleName,
+      consoleOffset,
+      actionText,
+      consoleText: out.textContent,
+      packsHtml: document.getElementById("packs").innerHTML,
+      consoleStick: stick,
+      consoleScroll: out.scrollTop
+    }));
+  } catch (err) {}
+}
+
+function restoreState() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem("modman-page") || "");
+  } catch (err) {
+    return false;
+  }
+  if (!saved || !Array.isArray(saved.packs)) return false;
+  packs = saved.packs.filter((p) => p && typeof p.name === "string");
+  actionText = typeof saved.actionText === "string" ? saved.actionText : "";
+  consoleOffset = Number.isFinite(saved.consoleOffset) && saved.consoleOffset >= 0 ? saved.consoleOffset : 0;
+  consoleName = saved.consoleName == null ? null : String(saved.consoleName);
+  if (!document.querySelector("#packs tr")) render();
+  const sel = document.getElementById("console-pack");
+  const names = runningPacks().map((p) => p.name);
+  sel.innerHTML = `<option value="">Actions</option>` + names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+  const follow = !!(consoleName && names.includes(consoleName));
+  sel.value = follow ? consoleName : "";
+  document.getElementById("console-cmd").disabled = !follow;
+  document.querySelector("#console-form button[type=submit]").disabled = !follow;
+  const svc = saved.service || {};
+  if (typeof svc.active === "string") paintDot("svc-dot", svc.active === "active", svc.active);
+  if (typeof svc.enabled === "string") paintDot("boot-dot", svc.enabled === "enabled", svc.enabled);
+  out.textContent = typeof saved.consoleText === "string" ? saved.consoleText : actionText;
+  if (saved.consoleStick) out.scrollTop = out.scrollHeight;
+  else if (Number.isFinite(saved.consoleScroll)) out.scrollTop = saved.consoleScroll;
+  return true;
+}
+
+function updateVisibleStatus() {
+  for (const pack of packs) {
+    const tr = document.querySelector(`#packs tr[data-name="${CSS.escape(pack.name)}"]`);
+    if (!tr) continue;
+    const statusCell = tr.querySelector(".status");
+    const cells = tr.children;
+    if (!statusCell || cells.length < 7) continue;
+    statusCell.className = `status ${pack.status}`;
+    statusCell.textContent = pack.status;
+    cells[1].textContent = pack.java;
+    const portInput = tr.querySelector("[data-port]");
+    if (portInput && document.activeElement !== portInput) {
+      const next = pack.port === "-" ? "" : String(pack.port);
+      if (portInput.value !== next) portInput.value = next;
+    }
+    cells[4].textContent = pack.cpu;
+    cells[5].textContent = pack.ram;
+    cells[6].textContent = pack.uptime;
+  }
+}
+
+function syncPacks() {
+  const rows = [...document.querySelectorAll("#packs tr[data-name]")];
+  const same = rows.length === packs.length && rows.every((tr, i) => {
+    const pack = packs[i];
+    return tr.dataset.name === pack.name && !!tr.querySelector('[data-act="disable"]') === !!pack.indexed;
+  });
+  if (!same) render();
+  else updateVisibleStatus();
+}
+
 function runningPacks() {
   return packs.filter((p) => p.status === "running");
 }
@@ -487,18 +633,24 @@ function fillConsolePacks() {
   const sel = document.getElementById("console-pack");
   if (document.activeElement === sel) return;
   const names = runningPacks().map((p) => p.name);
-  const same = names.length === sel.options.length && names.every((name, i) => sel.options[i].value === name);
-  const previous = sel.value;
+  const wanted = ["", ...names];
+  const same = wanted.length === sel.options.length && wanted.every((name, i) => sel.options[i].value === name);
   if (!same) {
-    sel.innerHTML = names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+    sel.innerHTML = `<option value="">Actions</option>` + names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
   }
-  const keep = names.includes(consoleName) ? consoleName : (names.includes(previous) ? previous : (names[0] || ""));
-  if (keep) sel.value = keep;
-  if (consoleName && !names.includes(consoleName)) {
-    consoleName = "";
+  if (consoleName == null) consoleName = names[0] || "";
+  else if (consoleName && !names.includes(consoleName)) {
+    consoleName = names[0] || "";
     consoleOffset = 0;
   }
-  if (!consoleName && sel.value && names.includes(sel.value)) consoleName = sel.value;
+  sel.value = consoleName;
+  if (!consoleName) {
+    out.textContent = actionText;
+    if (!consoleBusy) {
+      document.getElementById("console-cmd").disabled = true;
+      document.querySelector("#console-form button[type=submit]").disabled = true;
+    }
+  }
 }
 
 function trimConsole(text) {
@@ -514,25 +666,34 @@ function showConsole(text, replace) {
   const nearBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 48;
   out.textContent = next;
   if (nearBottom || replace) out.scrollTop = out.scrollHeight;
+  saveState();
 }
 
 async function refreshConsole(force) {
   if (!consoleName || hold || dlg.open) return;
-  if (consoleBusy && !force) return;
+  if ((consoleBusy || logBusy) && !force) return;
+  logBusy = true;
   const ticket = ++consoleTicket;
   const name = consoleName;
   const offset = consoleOffset;
-  const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=" + offset);
-  if (ticket !== consoleTicket || !data || hold || name !== consoleName) return;
-  if (data.ok === false) {
-    document.getElementById("console-msg").textContent = data.output || "Failed.";
-    return;
+  try {
+    const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=" + offset);
+    if (ticket !== consoleTicket || !data || hold || name !== consoleName) return;
+    if (data.ok === false) {
+      document.getElementById("console-msg").textContent = data.output || "Failed.";
+      return;
+    }
+    if (Number.isFinite(data.offset) && data.offset >= 0) consoleOffset = data.offset;
+    const chunk = data.output || "";
+    const replace = !!data.reset || offset === 0;
+    if (!replace && !chunk) {
+      saveState();
+      return;
+    }
+    showConsole(chunk, replace);
+  } finally {
+    logBusy = false;
   }
-  if (Number.isFinite(data.offset) && data.offset >= 0) consoleOffset = data.offset;
-  const chunk = data.output || "";
-  const replace = !!data.reset || offset === 0;
-  if (!replace && !chunk) return;
-  showConsole(chunk, replace);
 }
 
 async function followConsole(name) {
@@ -558,7 +719,17 @@ async function followConsole(name) {
 
 document.getElementById("console-pack").onchange = () => {
   if (consoleBusy) return;
-  followConsole(document.getElementById("console-pack").value);
+  const name = document.getElementById("console-pack").value;
+  if (!name) {
+    consoleName = "";
+    consoleOffset = 0;
+    out.textContent = actionText;
+    document.getElementById("console-msg").textContent = "";
+    document.getElementById("console-cmd").disabled = true;
+    document.querySelector("#console-form button[type=submit]").disabled = true;
+    return;
+  }
+  followConsole(name);
 };
 
 document.getElementById("console-form").onsubmit = async (ev) => {
@@ -588,9 +759,21 @@ document.getElementById("console-form").onsubmit = async (ev) => {
 };
 
 async function loadPacks() {
-  if (hold || dlg.open) return;
-  const data = await api("/api/packs");
+  if (hold || rowBusy || dlg.open || packsBusy) return;
+  packsBusy = true;
+  let data;
+  try {
+    data = await api("/api/packs");
+  } catch (err) {
+    packsBusy = false;
+    return;
+  }
+  if (hold || rowBusy || dlg.open) {
+    packsBusy = false;
+    return;
+  }
   if (!data || !data.packs) {
+    packsBusy = false;
     if (data && data.output) show(data.output);
     return;
   }
@@ -599,22 +782,21 @@ async function loadPacks() {
   const svc = data.service || {};
   paintDot("svc-dot", svc.active === "active", svc.active);
   paintDot("boot-dot", svc.enabled === "enabled", svc.enabled);
-  if (document.activeElement && document.activeElement.matches("input")) {
-    refreshConsole();
-    return;
-  }
-  render();
-  if (out.textContent === "Loading…" && !consoleName) show("");
+  syncPacks();
+  if (out.textContent === "Loading…" && !consoleName) out.textContent = actionText;
+  saveState();
+  packsBusy = false;
   refreshConsole();
 }
 
 document.getElementById("packs").onclick = async (ev) => {
   const btn = ev.target.closest("button");
-  if (!btn) return;
+  if (!btn || rowBusy) return;
   const tr = btn.closest("tr");
   const name = tr.dataset.name;
   const act = btn.dataset.act;
   const pack = packs.find((p) => p.name === name);
+  if ((act === "start" || act === "stop" || act === "restart") && (!pack || !pack.indexed)) return;
   if (act === "port") {
     const port = tr.querySelector("[data-port]").value;
     run({cmd: "port", name, port}, `Setting ${name} port to ${port}…`);
@@ -665,11 +847,7 @@ document.getElementById("packs").onclick = async (ev) => {
         delete_confirm: world === "delete" ? "yes" : ""
       };
       if (fields.mod_id) payload.mod_id = fields.mod_id;
-      hold = true;
-      show(`Updating ${name}…`);
-      api("/api/update", payload).then((data) => {
-        if (data) show(data.output || (data.ok ? "Done." : "Failed."));
-      }).finally(() => { hold = false; loadPacks(); });
+      finishServer(name, `Updating ${name}…`, () => api("/api/update", payload));
     });
     dlg.querySelectorAll('input[name="world"]').forEach((el) => {
       el.onchange = () => {
@@ -706,7 +884,11 @@ function clearSearch() {
   if (searchAbort) searchAbort.abort();
   document.getElementById("search-q").value = "";
   document.getElementById("search-results").innerHTML = "";
-  if (out.textContent.startsWith("Searching for ")) show("");
+  if (actionText.startsWith("Searching for ")) {
+    actionText = "";
+    if (consoleName === "") out.textContent = "";
+    saveState();
+  }
 }
 
 document.getElementById("search-clear").onclick = clearSearch;
@@ -750,6 +932,7 @@ document.getElementById("search-form").onsubmit = async (ev) => {
   }
 };
 
+if (!restoreState()) out.textContent = "Loading…";
 loadPacks();
 setInterval(loadPacks, 5000);
 setInterval(refreshConsole, 2000);

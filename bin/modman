@@ -42,6 +42,7 @@ Status values (STATUS column only — start/stop/restart use live screen presenc
   stopped                    No live screen session
   starting                   Screen is up; server has not printed Done yet
   running                    Screen is up and startup finished (Done (Xs)!)
+  error                      Screen is up, but the server crashed or hit an error
 
 Commands:
   list                       Display all modpacks in /srv/minecraft
@@ -245,59 +246,74 @@ is_running() {
 	local session
 	session="$(screen_name "$name")"
 
-	# Clean up dead screens so a crash doesn't block restart.
-	screen -wipe >/dev/null 2>&1 || true
-
+	# Do not screen -wipe here. A status refresh runs this often, and wipe
+	# can remove a live session that is busy, which closes the server console.
 	screen -ls 2>/dev/null | grep -E "\.${session}[[:space:]]" | grep -vq 'Dead'
 }
 
-# Display helper only: Minecraft has printed Done for the current boot.
-# Not for start/stop/restart decisions — use is_running for those.
-_display_startup_complete() {
+# Display helper only. Prints starting, running, or error from latest.log.
+# A new boot line clears an earlier crash in the same file.
+_log_boot_state() {
 	local name="$1"
-	local session
-	session="$(screen_name "$name")"
-	local tmp
-	tmp="$(mktemp "${TMPDIR:-/tmp}/mc-hardcopy.XXXXXX")"
-
-	# Dump current window + scrollback into an absolute path.
-	if screen -S "$session" -p 0 -X hardcopy -h "$tmp" 2>/dev/null; then
-		local i
-		for i in 1 2 3 4 5; do
-			[[ -s "$tmp" ]] && break
-			sleep 0.05
-		done
-		if grep -qE 'Done \([0-9.]+s\)!' "$tmp" 2>/dev/null; then
-			rm -f "$tmp"
-			return 0
-		fi
+	local log
+	if ! pack_stays_inside "$name"; then
+		printf '%s' "starting"
+		return 0
 	fi
-	rm -f "$tmp"
+	log="$MINECRAFT_ROOT/$name/logs/latest.log"
+	if [[ ! -f "$log" ]]; then
+		printf '%s' "starting"
+		return 0
+	fi
+	awk '
+		/Loading Minecraft .* with Fabric Loader/ { crashed = 0; ready = 0 }
+		/Starting minecraft server version/ { crashed = 0; ready = 0 }
+		/Done \([0-9.]+s\)!/ { if (!crashed) ready = 1 }
+		/Encountered an unexpected exception/ { crashed = 1; ready = 0 }
+		/Preparing crash report/ { crashed = 1; ready = 0 }
+		/This crash report has been saved/ { crashed = 1; ready = 0 }
+		/Failed to start the minecraft server/ { crashed = 1; ready = 0 }
+		/A fatal error has been detected by the Java Runtime/ { crashed = 1; ready = 0 }
+		END {
+			if (crashed) print "error"
+			else if (ready) print "running"
+			else print "starting"
+		}
+	' "$log"
+}
 
+# True when this pack's folder is the working directory of a java process.
+pack_java_running() {
+	local name="$1"
+	local pack_dir pid cwd comm
 	if ! pack_stays_inside "$name"; then
 		return 1
 	fi
-	local log="$MINECRAFT_ROOT/$name/logs/latest.log"
-	[[ -f "$log" ]] || return 1
-
-	# Current boot is complete if the last Done comes after the last start line.
-	awk '
-		/Starting minecraft server version/ { ready = 0 }
-		/Done \([0-9.]+s\)!/ { ready = 1 }
-		END { exit ready ? 0 : 1 }
-	' "$log"
+	pack_dir="$MINECRAFT_ROOT/$name"
+	for pid in /proc/[0-9]*; do
+		pid="${pid#/proc/}"
+		cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+		[[ "$cwd" == "$pack_dir" ]] || continue
+		comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+		[[ "$comm" == "java" ]] && return 0
+	done
+	return 1
 }
 
 # Display-only STATUS label. Control logic must use is_running, not this.
 display_status() {
 	local name="$1"
+	local state
 	if ! is_running "$name"; then
 		printf '%s' "stopped"
-	elif _display_startup_complete "$name"; then
-		printf '%s' "running"
-	else
-		printf '%s' "starting"
+		return 0
 	fi
+	state="$(_log_boot_state "$name")"
+	# The screen can outlive the server. Done was printed, then java exited.
+	if [[ "$state" == "running" ]] && ! pack_java_running "$name"; then
+		state="error"
+	fi
+	printf '%s' "$state"
 }
 
 # Color when stdout is a terminal.
@@ -325,6 +341,9 @@ print_status_cell() {
 			;;
 		running)
 			printf '\033[32m%s\033[0m' "$padded"
+			;;
+		error)
+			printf '\033[91m%s\033[0m' "$padded"
 			;;
 		*)
 			printf '%s' "$padded"
@@ -895,6 +914,43 @@ show_usage() {
 	print_usage_table "${INDEX_ENTRIES[@]}"
 }
 
+# The webpage service kills every process in its control group when it
+# restarts. A screen started there dies with it. The user service manager
+# is outside that group, so the screen keeps running.
+launch_server_screen() {
+	local name="$1"
+	local session="$2"
+	local pack_dir="$3"
+	local unit runtime bus quoted
+
+	if ! command -v systemd-run >/dev/null 2>&1; then
+		echo "Error: systemd-run is not installed, so '$name' was not started." >&2
+		return 1
+	fi
+	runtime="/run/user/$(id -u)"
+	bus="$runtime/bus"
+	if [[ ! -S "$bus" ]]; then
+		echo "Error: the user service is not running, so '$name' was not started." >&2
+		return 1
+	fi
+
+	unit="modman-${session}"
+	XDG_RUNTIME_DIR="$runtime"
+	DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}"
+	export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+	systemctl --user reset-failed "${unit}.service" >/dev/null 2>&1 || true
+
+	quoted="$(printf '%q' "$pack_dir")"
+	systemd-run --user --collect --quiet \
+		--expand-environment=no \
+		--unit="$unit" \
+		--property=Type=exec \
+		--description="Minecraft server ${name}" \
+		-- \
+		screen -DmS "$session" bash -c "cd ${quoted} && ./start.sh" \
+		|| return 1
+}
+
 start_one() {
 	local name="$1"
 	require_modpack "$name" || return 1
@@ -916,7 +972,18 @@ start_one() {
 		return 0
 	fi
 
-	screen -dmS "$session" bash -c "cd \"$pack_dir\" && ./start.sh"
+	# Drop a leftover dead socket so it does not block the new session.
+	screen -wipe >/dev/null 2>&1 || true
+	if is_running "$name"; then
+		echo "'$name' is already running (screen $session)."
+		return 0
+	fi
+
+	if [[ -n "${MODMAN_WEB_CALL:-}" ]]; then
+		launch_server_screen "$name" "$session" "$pack_dir" || return 1
+	else
+		screen -dmS "$session" bash -c "cd \"$pack_dir\" && ./start.sh"
+	fi
 	echo "Started '$name' in screen $session."
 }
 
@@ -3355,6 +3422,7 @@ repl() {
 
 if [[ "${1:-}" == "--web-call" ]]; then
 	shift
+	MODMAN_WEB_CALL=1
 	web_call "$@"
 	exit $?
 fi

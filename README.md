@@ -32,7 +32,7 @@ Each modpack is a folder under `/srv/minecraft`. The folder name is the name you
 
 When `start.sh` does not name a `java` program, modman reads `JAVA=` from `variables.txt` and uses that path for the Java version column.
 
-The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting** from **running**.
+The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting**, **running**, and **error** apart.
 
 `data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. The file stays on the computer where modman runs.
 
@@ -76,6 +76,7 @@ A server that is not running shows `-` for CPU, memory, and uptime.
 - **stopped** means there is no live screen session.
 - **starting** means the screen is up, and the server has not printed that it is done loading yet.
 - **running** means startup has finished.
+- **error** means the screen is still open, and the server has crashed or hit an error.
 
 If two servers use the same port, their names show up highlighted. They will not both start properly until the ports differ.
 
@@ -90,6 +91,8 @@ If two servers use the same port, their names show up highlighted. They will not
 | `restart` | Stops and starts every indexed server |
 | `restart MyPack` | Stops and starts that server |
 | `join MyPack` | Opens that server's live console |
+
+`start MyPack`, `stop MyPack`, and `restart MyPack` work for a server that is not enabled. That is there so you can try one without putting it in the boot list. The control page shows those buttons only for an enabled server.
 
 Leave the console with **Ctrl-A**, then **d**. That detaches and returns you to the `modman>` prompt. The server keeps running.
 
@@ -109,7 +112,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 ## The control page
 
-`web start` starts the page with the saved password. https is on port 8787. http is on port 8788. The page lists every modpack and has buttons for start, stop, restart, enable, disable, the port, install, update, and uninstall. The console list only includes running servers, and that console keeps updating. The command box sends one line to the selected server.
+`web start` starts the page with the saved password. https is on port 8787. http is on port 8788. The page lists every modpack. Enabled servers have start, stop, and restart. A server that is only installed does not, so a one-off test of that server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running. Every server has enable or disable, the port, update, and uninstall. The console list has Actions plus each running server, and a server console keeps updating. Actions shows button results, such as stopping a modpack. The command box sends one line to the selected server.
 
 Update still asks whether to keep or delete the world. Choosing delete asks you to type yes. The browser sends a SHA-256 hash of the password, and modman keeps that hash.
 
