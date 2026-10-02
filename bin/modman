@@ -65,10 +65,12 @@ Commands:
   uninstall MODPACK          Ask, then delete the pack folder from disk
   rename OLD NEW             Rename a modpack dir and update the index if present
   port MODPACK PORT          Set a modpack's server-port in server.properties
-  web start                  Ask for a password, then start https and http
+  web start                  Start https and http with the saved password
   web stop                   Stop the control page
-  web restart                Stop the page, then start it again with a new password
+  web restart                Stop the page, then start it again
   web status                 Show the control page link when it is running
+  web password               Set or change the webpage password
+  web pswd                   Set or change the webpage password
   web enable                 Enable the webpage service to start at boot
   web disable                Disable the webpage service from starting at boot
   web install                Install the webpage service for the current user
@@ -102,6 +104,7 @@ Examples:
   web status
   web stop
   web restart
+  web password
   web install
   web enable
   web disable
@@ -2340,7 +2343,7 @@ PY
 	return "$status"
 }
 
-web_install() {
+web_install_modpack() {
 	local mod_id="${1:-}"
 	local key name
 	if [[ ! "$mod_id" =~ ^[0-9]+$ ]]; then
@@ -2450,7 +2453,7 @@ web_call() {
 	packs) web_json_packs ;;
 	log) web_show_log "${1:-}" ;;
 	search) web_search "${1:-}" ;;
-	install) web_install "${1:-}" ;;
+	install) web_install_modpack "${1:-}" ;;
 	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
 	run) web_run "$@" ;;
 	*)
@@ -2714,8 +2717,48 @@ web_save_hash() {
 	umask "$old_umask"
 }
 
+# Prompt for the webpage password and store its hash in WEB_PASSWORD_HASH.
+web_prompt_hash() {
+	local password
+	if ! read -r -s -p "Password for the webpage: " password; then
+		echo
+		return 1
+	fi
+	echo
+	if [[ -z "$password" ]]; then
+		echo "Error: password cannot be empty." >&2
+		return 1
+	fi
+	if ! WEB_PASSWORD_HASH="$(printf '%s' "$password" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; then
+		unset password WEB_PASSWORD_HASH
+		echo "Error: could not hash the password." >&2
+		return 1
+	fi
+	unset password
+	if [[ ! "$WEB_PASSWORD_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+		unset WEB_PASSWORD_HASH
+		echo "Error: could not hash the password." >&2
+		return 1
+	fi
+}
+
+# Read the saved hash into WEB_PASSWORD_HASH.
+web_require_hash() {
+	local hash
+	if [[ ! -s "$WEB_HASH_FILE" ]]; then
+		echo "Error: no webpage password is set. Run web password first." >&2
+		return 1
+	fi
+	hash="$(tr -d '[:space:]' <"$WEB_HASH_FILE")"
+	if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+		echo "Error: the saved webpage password is invalid. Run web password." >&2
+		return 1
+	fi
+	WEB_PASSWORD_HASH="$hash"
+}
+
 web_start() {
-	local password passfile pid i hash
+	local passfile pid i
 	if web_is_running; then
 		echo "The webpage is already running."
 		web_print_links "$WEB_PORT_SAVED" "$WEB_HTTP_PORT_SAVED"
@@ -2738,30 +2781,9 @@ web_start() {
 	web_ensure_cert || return 1
 	web_trust_ca || true
 	echo "http on port ${WEB_HTTP_PORT} works before a browser will open https."
-	if ! read -r -s -p "Password for the webpage: " password; then
-		echo
-		return 1
-	fi
-	echo
-	if [[ -z "$password" ]]; then
-		echo "Error: password cannot be empty." >&2
-		return 1
-	fi
-	if ! hash="$(printf '%s' "$password" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; then
-		unset password
-		echo "Error: could not hash the password." >&2
-		return 1
-	fi
-	unset password
-	if [[ -f "$WEB_SYSTEMD_UNIT" || -f "$WEB_HASH_FILE" ]]; then
-		if ! web_save_hash "$hash"; then
-			unset hash
-			echo "Error: failed to write $WEB_HASH_FILE" >&2
-			return 1
-		fi
-	fi
+	web_require_hash || return 1
 	if [[ -f "$WEB_SYSTEMD_UNIT" ]]; then
-		unset hash
+		unset WEB_PASSWORD_HASH
 		echo "Starting $WEB_SYSTEMD_SERVICE..."
 		web_write_helper || return 1
 		run_systemctl start "$WEB_SYSTEMD_SERVICE" || return 1
@@ -2778,8 +2800,8 @@ web_start() {
 	fi
 	passfile="$(mktemp)"
 	chmod 600 "$passfile"
-	printf '%s' "$hash" >"$passfile"
-	unset hash
+	printf '%s' "$WEB_PASSWORD_HASH" >"$passfile"
+	unset WEB_PASSWORD_HASH
 	: >"$WEB_LOG_FILE"
 	# The file holds the password hash, not the password, and not on the command line.
 	MODMAN_WEB_CERT="$WEB_CERT_FILE" \
@@ -2854,6 +2876,21 @@ web_restart() {
 	web_start
 }
 
+web_password() {
+	web_prompt_hash || return 1
+	if ! web_save_hash "$WEB_PASSWORD_HASH"; then
+		unset WEB_PASSWORD_HASH
+		echo "Error: failed to write $WEB_HASH_FILE" >&2
+		return 1
+	fi
+	unset WEB_PASSWORD_HASH
+	echo "Webpage password updated."
+	if web_is_running || web_unit_active; then
+		echo "Restarting the webpage so the new password is used."
+		web_restart || return 1
+	fi
+}
+
 web_status() {
 	if web_is_running; then
 		echo "The webpage is running."
@@ -2865,7 +2902,7 @@ web_status() {
 }
 
 web_install() {
-	local user password hash unit_tmp
+	local user unit_tmp
 	if ! command -v python3 >/dev/null 2>&1; then
 		echo "Error: the webpage needs python3." >&2
 		return 1
@@ -2881,32 +2918,13 @@ web_install() {
 	user="$(service_user "$WEB_SYSTEMD_SERVICE")" || return 1
 
 	echo "The boot service keeps a hash of this password. The password itself is not stored."
-	if ! read -r -s -p "Password for the webpage: " password; then
-		echo
-		return 1
-	fi
-	echo
-	if [[ -z "$password" ]]; then
-		echo "Error: password cannot be empty." >&2
-		return 1
-	fi
-	if ! hash="$(printf '%s' "$password" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; then
-		unset password
-		echo "Error: could not hash the password." >&2
-		return 1
-	fi
-	unset password
-	if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
-		unset hash
-		echo "Error: could not hash the password." >&2
-		return 1
-	fi
-	if ! web_save_hash "$hash"; then
-		unset hash
+	web_prompt_hash || return 1
+	if ! web_save_hash "$WEB_PASSWORD_HASH"; then
+		unset WEB_PASSWORD_HASH
 		echo "Error: failed to write $WEB_HASH_FILE" >&2
 		return 1
 	fi
-	unset hash
+	unset WEB_PASSWORD_HASH
 
 	echo "Installing $WEB_SYSTEMD_SERVICE for user $user..."
 	unit_tmp="$(mktemp "${TMPDIR:-/tmp}/modman-web.service.XXXXXX")"
@@ -2947,6 +2965,8 @@ web_enable() {
 		echo "Error: $WEB_SYSTEMD_SERVICE is not installed. Run web install first." >&2
 		return 1
 	fi
+	web_require_hash || return 1
+	unset WEB_PASSWORD_HASH
 	web_ensure_cert || return 1
 	web_trust_ca || true
 	web_write_helper || return 1
@@ -2964,7 +2984,7 @@ web_disable() {
 web_control() {
 	local action="${1:-}"
 	if (($# > 1)); then
-		echo "Error: 'web' takes one action: start, stop, restart, status, enable, disable, or install." >&2
+		echo "Error: 'web' takes one action: start, stop, restart, status, password, enable, disable, or install." >&2
 		return 1
 	fi
 	case "$action" in
@@ -2980,6 +3000,9 @@ web_control() {
 	status)
 		web_status
 		;;
+	password|pswd)
+		web_password
+		;;
 	enable)
 		web_enable
 		;;
@@ -2990,7 +3013,7 @@ web_control() {
 		web_install
 		;;
 	"")
-		echo "Error: 'web' requires start, stop, restart, status, enable, disable, or install." >&2
+		echo "Error: 'web' requires start, stop, restart, status, password, enable, disable, or install." >&2
 		return 1
 		;;
 	*)
@@ -3128,7 +3151,7 @@ _repl_candidates() {
 			;;
 		web)
 			if ((cword == 1)); then
-				_ci_matches "$cur" start stop restart status enable disable install
+				_ci_matches "$cur" start stop restart status password pswd enable disable install
 			fi
 			;;
 		enable)

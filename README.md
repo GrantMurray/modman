@@ -109,7 +109,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 ## The control page
 
-`web start` asks for a password, then starts the page. https is on port 8787. http is on port 8788. The page lists every modpack and has buttons for start, stop, restart, enable, disable, the port, the log, install, update, and uninstall.
+`web start` starts the page with the saved password. https is on port 8787. http is on port 8788. The page lists every modpack and has buttons for start, stop, restart, enable, disable, the port, the log, install, update, and uninstall.
 
 Update still asks whether to keep or delete the world. Choosing delete asks you to type yes. The browser sends a SHA-256 hash of the password, and modman keeps that hash.
 
@@ -119,15 +119,16 @@ From anywhere else, use a domain name. Put that name on one line in `data/.modma
 
 | Command | What it does |
 | --- | --- |
-| `web start` | Asks for a password, then starts the page |
+| `web start` | Starts the page with the saved password |
 | `web stop` | Shuts the page down |
-| `web reset` | Shuts the page down and starts it again, asking for a new password |
+| `web restart` | Shuts the page down and starts it again |
 | `web status` | Prints the link again |
-| `web install` | Saves the password hash and installs `modman-web.service`. Does not enable or start the page |
-| `web enable` | Starts the page at boot. Does not start it now |
+| `web password` | Sets or changes the webpage password. `web pswd` does the same |
+| `web install` | Asks for a password, saves the hash, and installs `modman-web.service`. Does not enable or start the page |
+| `web enable` | Starts the page at boot with the saved password. Does not start it now |
 | `web disable` | Stops the page from starting at boot. Leaves a running page up |
 
-From the shell, `modman --web start` and `modman -w status` run one of those commands and then exit. The actions are start, stop, reset, status, enable, disable, and install.
+From the shell, `modman --web start` and `modman -w status` run one of those commands and then exit. The actions are start, stop, restart, status, password, enable, disable, and install. `web password` restarts a running page so the new password is the one that signs in.
 
 ## Open the page from the internet
 
@@ -145,7 +146,7 @@ The connection has to pass through unchanged. The certificate is created on the 
 Then:
 
 1. Put the domain on one line in `data/.modman-web-domain`.
-2. Start the page with `web start`. If it is already running, run `web reset`.
+2. Start the page with `web start`. If it is already running, run `web restart`.
 3. Open `https://modman.example.com/` from another computer and sign in.
 
 Use `web install` and `web enable` when the page should start again after a reboot. The tunnel program has to start on boot as well, or the name will not reach the page.
