@@ -4,7 +4,7 @@
 
 ## Install it
 
-Put this project folder somewhere permanent, for example `~/.local/share/modman`. The `bin` and `data` folders need to stay next to each other.
+Put this project folder somewhere permanent, for example `~/.local/share/modman`. The `bin`, `tools`, and `data` folders need to stay next to each other. `bin` holds `modman`. The other programs live in `tools`, off your `PATH`.
 
 Make the program executable:
 
@@ -109,9 +109,35 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 | `service disable` | Disables the service so it does not start at boot. Does not stop servers that are already running |
 | `service install` | Installs `mc-servers.service` so it runs as the user who launched modman. Does not enable or start it |
 
+## The control page
+
+`web start` asks for a password, then starts the page. https is on port 8787. http is on port 8788. Put one domain name in `data/.modman-web-domain`. The page answers the signing check on the http port, gets a certificate for that name from Let's Encrypt, and renews it. Other machines open `https://that-name/`. That name has to arrive here on ports 80 and 443. Links that use an address on this machine still use the local certificate. Install that one from `http://<address>:8788/modman-ca.crt` when a browser asks for it. Open a link from another computer and sign in with the password. The page lists every modpack and has buttons for start, stop, restart, enable, disable, the port, the log, install, update, and uninstall. Update still asks whether to keep or delete the world, and deleting the world asks you to type yes.
+
+`web status` prints the link again. `web stop` shuts the page down. `web restart` shuts it down and starts it again, asking for a new password. From the shell, `modman --web start` and `modman -w status` run those same commands without opening the prompt. The actions are start, stop, restart, status, enable, disable, and install. You still type the password to sign in. The browser sends a SHA-256 hash of it, and modman keeps that hash for the run of the page.
+
+`web install` asks for that password, saves the hash, and installs `modman-web.service` to run as the user who launched modman. It does not enable or start the page. `web enable` makes that service start at boot with https and the http fallback. It does not start the page now. `web disable` turns that off and leaves a running page up.
+
+## Open the page from the internet
+
+The page listens on this computer: https on port 8787, http on port 8788. Another network cannot open those ports until something on the public internet delivers port 80 to local port 8788 and port 443 to local port 8787. The bytes have to pass through unchanged. The certificate is created here.
+
+This machine uses [playit.gg](https://playit.gg) for that delivery. A router port forward to a public address works the same way: forward public 80 to 8788 and public 443 to 8787, and point the domain at that public address with an A record.
+
+1. Start the page with `web start`. Use `web install` and `web enable` when it should come back after a reboot.
+2. Install the playit agent on this computer and leave it running. The service name is `playit.service`.
+3. In the playit account, create two TCP tunnels. One accepts public port 80 and connects to `127.0.0.1:8788`. The other accepts public port 443 and connects to `127.0.0.1:8787`.
+4. Add the domain in playit as an external domain. At the DNS host, set a CNAME from that name to the gateway hostname playit shows.
+5. Put that domain on one line in `data/.modman-web-domain`.
+
+```text
+modman.example.com
+```
+
+6. Restart the page if it was already running. It answers Let's Encrypt on port 80, stores the certificate, and renews it while those two tunnels stay up. From another computer, open `https://modman.example.com/` and sign in with the page password.
+
 ## Install a modpack
 
-`install` asks for a modpack name, searches CurseForge, and lists the matches. Type the number of the one you want. modman downloads that project's server pack and unpacks it under `/srv/minecraft`. The folder name is the modpack name with spaces removed, the same shape as the folders already there. If the pack has no `start.sh`, modman writes one that launches `run.sh`, the Forge `unix_args.txt` file, or the server jar.
+`install` asks for a modpack name, searches CurseForge, and lists the matches. Press Enter to leave the name prompt or the list. Type the number of the one you want. The page has a Clear button beside Search that drops the results. modman downloads that project's server pack and unpacks it under `/srv/minecraft`. The folder name is the modpack name with spaces removed, the same shape as the folders already there. If the pack has no `start.sh`, modman renames `run.sh` (or another launch script) to `start.sh`. When the pack has no launch script, modman writes a `start.sh` that uses the Forge `unix_args.txt` file or the server jar. A pack that only includes a Forge or NeoForge installer gets a `start.sh` that runs that installer, then `run.sh`.
 
 The CurseForge project id, and the server pack file id, are written to `.curseforge-id` in that folder so a later update can tell which project the folder came from.
 
@@ -119,14 +145,14 @@ Put a CurseForge API key on one line in `data/curseforge-api-key`. Create the ke
 
 `install` leaves the new pack out of the index. Use `enable` with the folder name when it should start with the others. If the project has no server pack, install stops.
 
-`update Cobbleverse` installs a newer server pack into a folder that is already there. It asks you to type yes first. The world, `server.properties`, ops, whitelist, bans, and `eula.txt` stay. A running server is stopped first. If the folder has no `.curseforge-id`, modman searches CurseForge using the folder name. When that search has no matches, it asks for a modpack name and lists results the same way `install` does.
+`update Cobbleverse` installs a newer server pack into a folder that is already there. It asks whether to keep or delete the world. Choosing delete asks you to type yes before the world, `world_nether`, and `world_the_end` are removed. `server.properties`, ops, whitelist, bans, and `eula.txt` stay either way. It then asks you to type yes before the update. A running server is stopped first. When the new pack has no `start.sh`, modman writes one the same way `install` does. If the folder has no `.curseforge-id`, modman searches CurseForge using the folder name. When that search has no matches, it asks for a modpack name and lists results the same way `install` does.
 
 ## Change a server
 
 | Command | What it does |
 | --- | --- |
 | `install` | Searches CurseForge and installs the server pack you pick |
-| `update Cobbleverse` | Installs a newer server pack into that folder, after you type yes. Keeps the world and local server settings |
+| `update Cobbleverse` | Installs a newer server pack into that folder, after you type yes. Asks whether to keep or delete the world |
 | `enable Ascendra` | Puts that server in the index so it starts with the others |
 | `disable Linggango` | Stops it if it is running, then takes it out of the index |
 | `uninstall Linggango` | Asks you to type yes, then deletes that server folder. Stops it first if it is running, and takes it out of the index if it was listed |

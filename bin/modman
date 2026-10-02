@@ -3,19 +3,40 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TOOLS_DIR="${ROOT_DIR}/tools"
 INDEX_FILE="${ROOT_DIR}/data/index.txt"
 HISTORY_FILE="${ROOT_DIR}/data/.modman_history"
 MINECRAFT_ROOT="/srv/minecraft"
 SYSTEMD_SERVICE="mc-servers.service"
 SYSTEMD_UNIT="/etc/systemd/system/${SYSTEMD_SERVICE}"
 SYSTEMD_HELPER="/usr/local/bin/start_mc_servers"
+WEB_PORT=8787
+WEB_HTTP_PORT=8788
+WEB_STATE_FILE="${ROOT_DIR}/data/.modman-web.state"
+WEB_LOG_FILE="${ROOT_DIR}/data/.modman-web.log"
+WEB_SERVICE_STATE_FILE="${ROOT_DIR}/data/.modman-service-state"
+WEB_PY="${TOOLS_DIR}/modman-web.py"
+WEB_SYSTEMD_SERVICE="modman-web.service"
+WEB_SYSTEMD_UNIT="/etc/systemd/system/${WEB_SYSTEMD_SERVICE}"
+WEB_SYSTEMD_HELPER="/usr/local/bin/modman-web"
+WEB_HASH_FILE="${ROOT_DIR}/data/.modman-web-hash"
+WEB_CERT_FILE="${ROOT_DIR}/data/.modman-web-cert.pem"
+WEB_KEY_FILE="${ROOT_DIR}/data/.modman-web-key.pem"
+WEB_CA_FILE="${ROOT_DIR}/data/.modman-web-ca.pem"
+WEB_CA_KEY_FILE="${ROOT_DIR}/data/.modman-web-ca-key.pem"
+WEB_DOMAIN_FILE="${ROOT_DIR}/data/.modman-web-domain"
+CF_CANCELLED=0
 
 usage() {
 	cat <<EOF
 Usage: $(basename "$0")
+       $(basename "$0") --web ACTION
+       $(basename "$0") -w ACTION
 
 Interactive modpack manager for ${SYSTEMD_SERVICE} (via index.txt).
 Type commands at the prompt; type exit to leave.
+
+--web and -w run one webpage command, then exit. ACTION is start, stop, restart, status, enable, disable, or install.
 
 Status values (STATUS column only — start/stop/restart use live screen presence):
   stopped                    No live screen session
@@ -44,6 +65,13 @@ Commands:
   uninstall MODPACK          Ask, then delete the pack folder from disk
   rename OLD NEW             Rename a modpack dir and update the index if present
   port MODPACK PORT          Set a modpack's server-port in server.properties
+  web start                  Ask for a password, then start https and http
+  web stop                   Stop the control page
+  web restart                Stop the page, then start it again with a new password
+  web status                 Show the control page link when it is running
+  web enable                 Enable the webpage service to start at boot
+  web disable                Disable the webpage service from starting at boot
+  web install                Install the webpage service for the current user
   help                       Show this help
   exit                       Leave the manager
 
@@ -70,6 +98,21 @@ Examples:
   uninstall Linggango
   rename MonkeyMine MonkeyMine2
   port Cobbleverse 25570
+  web start
+  web status
+  web stop
+  web restart
+  web install
+  web enable
+  web disable
+
+From the shell:
+  $(basename "$0") --web start
+  $(basename "$0") -w status
+  $(basename "$0") --web restart
+  $(basename "$0") -w stop
+  $(basename "$0") --web install
+  $(basename "$0") -w enable
 EOF
 }
 
@@ -101,6 +144,10 @@ write_index() {
 
 get_port() {
 	local name="$1"
+	if ! pack_stays_inside "$name"; then
+		printf '%s' "-"
+		return 0
+	fi
 	local props="$MINECRAFT_ROOT/$name/server.properties"
 	local port=""
 
@@ -118,6 +165,9 @@ get_port() {
 # Java executable a pack's start.sh launches: a literal java command, or JAVA= from variables.txt.
 java_bin_for() {
 	local name="$1"
+	if ! pack_stays_inside "$name"; then
+		return 0
+	fi
 	local start="$MINECRAFT_ROOT/$name/start.sh"
 	local vars="$MINECRAFT_ROOT/$name/variables.txt"
 	local bin="" line
@@ -221,6 +271,9 @@ _display_startup_complete() {
 	fi
 	rm -f "$tmp"
 
+	if ! pack_stays_inside "$name"; then
+		return 1
+	fi
 	local log="$MINECRAFT_ROOT/$name/logs/latest.log"
 	[[ -f "$log" ]] || return 1
 
@@ -427,6 +480,7 @@ add_modpack() {
 		echo "Error: missing modpack name." >&2
 		return 1
 	fi
+	require_modpack "$name" || return 1
 
 	local pack_dir="$MINECRAFT_ROOT/$name"
 	if [[ ! -d "$pack_dir" ]]; then
@@ -455,6 +509,7 @@ remove_modpack() {
 		echo "Error: missing modpack name." >&2
 		return 1
 	fi
+	require_modpack "$name" || return 1
 
 	read_index
 	if ! in_index "$name"; then
@@ -486,10 +541,7 @@ uninstall_modpack() {
 		echo "Error: missing modpack name." >&2
 		return 1
 	fi
-	if ! valid_modpack_name "$name"; then
-		echo "Error: '$name' is not a modpack name." >&2
-		return 1
-	fi
+	require_modpack "$name" || return 1
 
 	dest="${MINECRAFT_ROOT}/${name}"
 	if [[ -L "$dest" ]]; then
@@ -516,7 +568,9 @@ uninstall_modpack() {
 	if ((indexed)); then
 		echo "It will also be taken out of the index."
 	fi
-	if ! read -r -e -p "Type yes to confirm: " answer; then
+	if [[ "${MODMAN_YES:-}" == "1" ]]; then
+		answer=yes
+	elif ! read -r -e -p "Type yes to confirm: " answer; then
 		echo
 		return 1
 	fi
@@ -547,10 +601,41 @@ uninstall_modpack() {
 
 valid_modpack_name() {
 	local name="$1"
-	# Directory basename only: no empty, path, or relative-segment names.
-	[[ -n "$name" ]] || return 1
+	# One directory name. ".." anywhere, slashes, and shell metacharacters
+	# would let a path leave MINECRAFT_ROOT.
+	[[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
 	[[ "$name" != "." && "$name" != ".." ]] || return 1
-	[[ "$name" != */* && "$name" != *\\* ]] || return 1
+	[[ "$name" != *..* ]] || return 1
+	return 0
+}
+
+# True when name is a safe folder name and, if it exists, resolves to a
+# direct child of MINECRAFT_ROOT. Symlinks fail this check.
+pack_stays_inside() {
+	local name="$1"
+	local root dest real_root real_dest
+	valid_modpack_name "$name" || return 1
+	root="${MINECRAFT_ROOT%/}"
+	dest="${root}/${name}"
+	[[ -L "$dest" ]] && return 1
+	if [[ -e "$dest" ]]; then
+		real_root="$(realpath -e "$root" 2>/dev/null)" || return 1
+		real_dest="$(realpath -e "$dest" 2>/dev/null)" || return 1
+		[[ "$real_dest" == "$real_root/$name" ]] || return 1
+	fi
+	return 0
+}
+
+require_modpack() {
+	local name="$1"
+	if ! valid_modpack_name "$name"; then
+		echo "Error: '$name' is not a modpack name." >&2
+		return 1
+	fi
+	if ! pack_stays_inside "$name"; then
+		echo "Error: '$name' is outside $MINECRAFT_ROOT." >&2
+		return 1
+	fi
 	return 0
 }
 
@@ -563,10 +648,8 @@ rename_modpack() {
 		return 1
 	fi
 
-	if ! valid_modpack_name "$old" || ! valid_modpack_name "$new"; then
-		echo "Error: modpack names must be plain directory names (no path components)." >&2
-		return 1
-	fi
+	require_modpack "$old" || return 1
+	require_modpack "$new" || return 1
 
 	if [[ "$old" == "$new" ]]; then
 		echo "'$old' is already named '$new'."
@@ -641,6 +724,7 @@ set_port() {
 		echo "Error: port requires MODPACK and PORT." >&2
 		return 1
 	fi
+	require_modpack "$name" || return 1
 
 	local pack_dir="$MINECRAFT_ROOT/$name"
 	if [[ ! -d "$pack_dir" ]]; then
@@ -685,6 +769,7 @@ show_status() {
 	local name="${1:-}"
 
 	if [[ -n "$name" ]]; then
+		require_modpack "$name" || return 1
 		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 			return 1
@@ -745,6 +830,10 @@ format_elapsed() {
 # CPU, RAM, and uptime of the pack's Java process. "-" when it is not running.
 pack_usage_cells() {
 	local name="$1"
+	if ! pack_stays_inside "$name"; then
+		printf '%s\n' "-" "-" "-"
+		return 0
+	fi
 	local pack_dir="$MINECRAFT_ROOT/$name"
 	local pid cwd comm stats pcpu rss etime
 
@@ -785,6 +874,7 @@ show_usage() {
 	local name="${1:-}"
 
 	if [[ -n "$name" ]]; then
+		require_modpack "$name" || return 1
 		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 			return 1
@@ -804,6 +894,7 @@ show_usage() {
 
 start_one() {
 	local name="$1"
+	require_modpack "$name" || return 1
 	local pack_dir="$MINECRAFT_ROOT/$name"
 	local session
 	session="$(screen_name "$name")"
@@ -858,6 +949,7 @@ start_servers() {
 
 stop_one() {
 	local name="$1"
+	require_modpack "$name" || return 1
 	local session
 	session="$(screen_name "$name")"
 
@@ -884,6 +976,7 @@ join_screen() {
 		echo "Error: missing modpack name." >&2
 		return 1
 	fi
+	require_modpack "$name" || return 1
 	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 		return 1
@@ -909,6 +1002,7 @@ stop_servers() {
 	local name="${1:-}"
 
 	if [[ -n "$name" ]]; then
+		require_modpack "$name" || return 1
 		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 			return 1
@@ -933,6 +1027,7 @@ restart_servers() {
 	local name="${1:-}"
 
 	if [[ -n "$name" ]]; then
+		require_modpack "$name" || return 1
 		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 			return 1
@@ -950,7 +1045,9 @@ restart_servers() {
 
 run_systemctl() {
 	local -a args=("$@")
-	if systemctl "${args[@]}" 2>/dev/null; then
+	# --no-ask-password skips the polkit identity prompt. On this machine that
+	# prompt asks for helen's login password, which is not the sudo password.
+	if systemctl --no-ask-password "${args[@]}" 2>/dev/null; then
 		return 0
 	fi
 	if command -v sudo >/dev/null 2>&1; then
@@ -967,7 +1064,8 @@ service_status() {
 
 service_start() {
 	echo "Starting $SYSTEMD_SERVICE..."
-	run_systemctl start "$SYSTEMD_SERVICE"
+	run_systemctl start "$SYSTEMD_SERVICE" || return 1
+	web_service_mark active
 	echo "$SYSTEMD_SERVICE start requested."
 }
 
@@ -975,7 +1073,8 @@ service_stop() {
 	echo "Stopping indexed packs and $SYSTEMD_SERVICE..."
 	# Unit has no ExecStop; quit screens first so servers actually halt.
 	stop_servers || return 1
-	run_systemctl stop "$SYSTEMD_SERVICE"
+	run_systemctl stop "$SYSTEMD_SERVICE" || return 1
+	web_service_mark inactive
 	echo "$SYSTEMD_SERVICE stopped."
 }
 
@@ -983,7 +1082,8 @@ service_restart() {
 	echo "Restarting indexed packs via $SYSTEMD_SERVICE..."
 	stop_servers || return 1
 	sleep 1
-	run_systemctl restart "$SYSTEMD_SERVICE"
+	run_systemctl restart "$SYSTEMD_SERVICE" || return 1
+	web_service_mark active
 	echo "$SYSTEMD_SERVICE restarted."
 }
 
@@ -1001,12 +1101,13 @@ service_disable() {
 
 # systemd refuses User= that is not a real account name.
 service_user() {
+	local unit="${1:-$SYSTEMD_SERVICE}"
 	local user="${SUDO_USER:-${USER:-}}"
 	if [[ -z "$user" || "$user" == "root" ]]; then
 		user="$(id -un)"
 	fi
 	if [[ -z "$user" || "$user" == "root" ]]; then
-		echo "Error: refusing to install $SYSTEMD_SERVICE as root. Run modman as the account that owns the modpacks." >&2
+		echo "Error: refusing to install $unit as root. Run modman as the account that owns the modpacks." >&2
 		return 1
 	fi
 	if ! id "$user" >/dev/null 2>&1; then
@@ -1052,7 +1153,7 @@ service_install() {
 		return 1
 	fi
 
-	helper_src="${SCRIPT_DIR}/start_mc_servers.sh"
+	helper_src="${TOOLS_DIR}/start_mc_servers"
 	if [[ ! -f "$helper_src" ]]; then
 		echo "Error: missing helper script: $helper_src" >&2
 		return 1
@@ -1077,7 +1178,8 @@ Description=Start minecraft servers in seperate screens
 After=network.target
 
 [Service]
-Type=forking
+Type=oneshot
+RemainAfterExit=yes
 User=${user}
 ExecStart=${SYSTEMD_HELPER}
 
@@ -1094,7 +1196,7 @@ EOF
 
 	echo "Installed $SYSTEMD_UNIT (User=$user)."
 	echo "Installed $SYSTEMD_HELPER."
-	run_systemctl daemon-reload
+	run_systemctl daemon-reload || return 1
 	echo "$SYSTEMD_SERVICE installed. It was not enabled or started."
 	echo "Run 'service enable' to start it at boot, or 'service start' to start it now."
 }
@@ -1164,6 +1266,9 @@ cf_api_get() {
 	body="$(mktemp)"
 	if ! http="$(curl -sS --retry 2 -A modman -H "Accept: application/json" -H "x-api-key: ${key}" -o "$body" -w "%{http_code}" "$url")"; then
 		rm -f "$body"
+		if ((CF_CANCELLED)); then
+			return 3
+		fi
 		echo "Error: CurseForge request failed." >&2
 		return 1
 	fi
@@ -1193,7 +1298,7 @@ pack_dir_name() {
 import re, sys
 name = re.sub(r"\s+", "", sys.argv[1])
 name = re.sub(r"[^A-Za-z0-9._-]", "", name)
-if not name or name in {".", ".."}:
+if not name or name in {".", ".."} or ".." in name:
     sys.exit(1)
 sys.stdout.write(name)
 PY
@@ -1301,6 +1406,22 @@ print(f"{display}\t{filename}\t{', '.join(versions)}")
 PY
 }
 
+# Print the CurseForge project name for a numeric project id.
+cf_mod_name() {
+	local key="$1"
+	local mod_id="$2"
+	local body
+	body="$(cf_api_get "$key" "${CF_API}/mods/${mod_id}")" || return 1
+	run_python_on_json "$body" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1])).get("data") or {}
+name = (data.get("name") or "").replace("\n", " ").strip()
+if not name:
+    sys.exit(1)
+print(name)
+PY
+}
+
 cf_download_url() {
 	local key="$1"
 	local mod_id="$2"
@@ -1342,6 +1463,8 @@ def hinted(filenames):
     for name in filenames:
         lower = name.lower()
         if lower.endswith(".jar") and "installer" not in lower and "server" in lower:
+            return True
+        if lower.endswith(".jar") and "installer" in lower and ("forge" in lower or "neoforge" in lower):
             return True
     return False
 
@@ -1394,9 +1517,29 @@ def write(body, also_exec=None):
     print("generated")
 
 header = "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+files_here = {
+    name.lower(): name
+    for name in os.listdir(root)
+    if os.path.isfile(os.path.join(root, name))
+}
 for name in ("run.sh", "startserver.sh", "start_server.sh", "serverstart.sh"):
-    if os.path.isfile(os.path.join(root, name)):
-        write(header + f"exec ./{sh_quote(name)} nogui\n", name)
+    actual = files_here.get(name)
+    if actual:
+        src = os.path.join(root, actual)
+        os.rename(src, dest)
+        with open(dest, "rb") as fh:
+            body = fh.read()
+        # The old wrapper passed nogui. Keep that when the script forwards its arguments.
+        code = b"\n".join(
+            line for line in body.splitlines()
+            if not line.lstrip().startswith(b"#")
+        )
+        if b"nogui" not in code and b'"$@"' in code:
+            body = body.replace(b'"$@"', b'nogui "$@"', 1)
+            with open(dest, "wb") as fh:
+                fh.write(body)
+        os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"renamed {actual}")
         sys.exit(0)
 
 unix = []
@@ -1444,24 +1587,52 @@ if jars:
                 write(header + f"exec java -Xms4G -Xmx8G -jar {jar} nogui\n")
             sys.exit(0)
 
+installers = [
+    name for name in files_here.values()
+    if name.lower().endswith(".jar")
+    and "installer" in name.lower()
+    and ("forge" in name.lower() or "neoforge" in name.lower())
+]
+if len(installers) == 1:
+    jar = sh_quote(installers[0])
+    write(
+        header
+        + f"if [ ! -f ./run.sh ]; then\n"
+        + f"  java -jar {jar} --installServer\n"
+        + f"fi\n"
+        + "exec ./run.sh nogui\n"
+    )
+    sys.exit(0)
+
 sys.stderr.write("Error: server pack has no start.sh, run script, or server jar\n")
 sys.exit(1)
 PY
 }
 
 # Ask for a search string. Prints the trimmed query on stdout.
+# Returns 3 when the user cancels.
 cf_prompt_modpack_query() {
 	local query
 	echo "What modpack would you like to search for?" >&2
-	if ! read -r -e -p "Modpack: " query; then
+	CF_CANCELLED=0
+	trap 'CF_CANCELLED=1' INT
+	if ! read -r -e -p "Modpack, or press Enter to cancel: " query; then
+		trap - INT
 		echo
-		return 1
+		echo "Cancelled." >&2
+		return 3
+	fi
+	trap - INT
+	if ((CF_CANCELLED)); then
+		echo
+		echo "Cancelled." >&2
+		return 3
 	fi
 	query="${query#"${query%%[![:space:]]*}"}"
 	query="${query%"${query##*[![:space:]]}"}"
 	if [[ -z "$query" ]]; then
-		echo "Error: enter a modpack name." >&2
-		return 1
+		echo "Cancelled." >&2
+		return 3
 	fi
 	printf '%s\n' "$query"
 }
@@ -1476,7 +1647,18 @@ cf_select_modpack() {
 	local n=0 choice idx
 
 	echo "Searching CurseForge..." >&2
-	tsv="$(cf_search_modpacks "$key" "$query")" || return 1
+	CF_CANCELLED=0
+	trap 'CF_CANCELLED=1' INT
+	tsv="$(cf_search_modpacks "$key" "$query")" || n=$?
+	trap - INT
+	if ((CF_CANCELLED)); then
+		echo
+		echo "Cancelled." >&2
+		return 3
+	fi
+	if ((n != 0)); then
+		return "$n"
+	fi
 	while IFS=$'\t' read -r id name downloads summary; do
 		[[ -n "$id" ]] || continue
 		n=$((n + 1))
@@ -1494,9 +1676,19 @@ cf_select_modpack() {
 		return 2
 	fi
 
+	CF_CANCELLED=0
+	trap 'CF_CANCELLED=1' INT
 	if ! read -r -e -p "Select a modpack by number, or press Enter to cancel: " choice; then
+		trap - INT
 		echo
-		return 1
+		echo "Cancelled." >&2
+		return 3
+	fi
+	trap - INT
+	if ((CF_CANCELLED)); then
+		echo
+		echo "Cancelled." >&2
+		return 3
 	fi
 	if [[ -z "$choice" ]]; then
 		echo "Cancelled." >&2
@@ -1566,18 +1758,69 @@ cf_stage_server_pack() {
 	printf '%s\n%s\n%s\n' "$work" "$root" "$generated"
 }
 
-# Replace dest with the staged pack. Keep the world and local server files.
+# Ask whether to keep the world. Returns 0 to keep it, 2 when delete was confirmed.
+cf_prompt_world_choice() {
+	local dest="$1"
+	local choice answer
+
+	if [[ -n "${MODMAN_WORLD:-}" ]]; then
+		case "$MODMAN_WORLD" in
+		keep)
+			return 0
+			;;
+		delete)
+			return 2
+			;;
+		*)
+			echo "Error: world must be keep or delete." >&2
+			return 1
+			;;
+		esac
+	fi
+	echo "Keep the world, or delete it?"
+	if ! read -r -e -p "World [keep/delete]: " choice; then
+		echo
+		return 1
+	fi
+	case "${choice,,}" in
+	keep)
+		return 0
+		;;
+	delete)
+		;;
+	*)
+		echo "Cancelled."
+		return 3
+		;;
+	esac
+	echo "Delete world, world_nether, and world_the_end in ${dest}?"
+	if ! read -r -e -p "Type yes to delete the world: " answer; then
+		echo
+		return 1
+	fi
+	if [[ "${answer,,}" != "yes" ]]; then
+		echo "Cancelled."
+		return 3
+	fi
+	return 2
+}
+
+# Replace dest with the staged pack. Keep local server files.
+# The third argument is 1 to keep the world, or 0 to leave it behind.
 cf_replace_pack() {
 	local name="$1"
 	local root="$2"
+	local keep_world="${3:-1}"
 	local dest="${MINECRAFT_ROOT}/${name}"
 	local backup="${MINECRAFT_ROOT}/.modman-update-${name}"
 	local hold item
 	local -a keep=(
-		world world_nether world_the_end
 		server.properties ops.json whitelist.json
 		banned-players.json banned-ips.json eula.txt
 	)
+	if [[ "$keep_world" == "1" ]]; then
+		keep=(world world_nether world_the_end "${keep[@]}")
+	fi
 
 	if [[ -e "$backup" ]]; then
 		echo "Error: '$backup' already exists. Move it aside before updating." >&2
@@ -1636,9 +1879,7 @@ cf_replace_pack() {
 
 install_modpack() {
 	local key query picked select_status=0
-	local mod_id mod_name folder dest
-	local file_id meta display versions
-	local staged work root generated status=0
+	local mod_id mod_name
 
 	if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
 		echo "Error: install needs curl and python3." >&2
@@ -1649,7 +1890,13 @@ install_modpack() {
 		return 1
 	fi
 	key="$(read_curseforge_key)" || return 1
-	query="$(cf_prompt_modpack_query)" || return 1
+	query="$(cf_prompt_modpack_query)" || select_status=$?
+	if ((select_status == 3)); then
+		return 0
+	fi
+	if ((select_status != 0)); then
+		return 1
+	fi
 	picked="$(cf_select_modpack "$key" "$query")" || select_status=$?
 	if ((select_status == 2 || select_status == 3)); then
 		return 0
@@ -1658,6 +1905,30 @@ install_modpack() {
 		return 1
 	fi
 	IFS=$'\t' read -r mod_id mod_name <<<"$picked"
+	install_chosen_modpack "$mod_id" "$mod_name"
+}
+
+# Download and unpack a CurseForge project that has already been chosen.
+install_chosen_modpack() {
+	local mod_id="$1"
+	local mod_name="$2"
+	local key folder dest
+	local file_id meta display versions
+	local staged work root generated status=0
+
+	if [[ ! "$mod_id" =~ ^[0-9]+$ ]]; then
+		echo "Error: bad CurseForge project id." >&2
+		return 1
+	fi
+	if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+		echo "Error: install needs curl and python3." >&2
+		return 1
+	fi
+	if [[ ! -d "$MINECRAFT_ROOT" ]]; then
+		echo "Error: $MINECRAFT_ROOT does not exist." >&2
+		return 1
+	fi
+	key="$(read_curseforge_key)" || return 1
 	if ! folder="$(pack_dir_name "$mod_name")"; then
 		echo "Error: cannot make a folder name from '$mod_name'." >&2
 		return 1
@@ -1711,6 +1982,8 @@ install_modpack() {
 	echo "Installed ${mod_name} in ${dest}"
 	if [[ "$generated" == "generated" ]]; then
 		echo "Wrote start.sh; the server pack did not include one."
+	elif [[ "$generated" == renamed\ * ]]; then
+		echo "Renamed ${generated#renamed } to start.sh."
 	fi
 	echo "CurseForge project id ${mod_id} saved in ${dest}/.curseforge-id"
 	echo "Enable it with: enable ${folder}"
@@ -1722,16 +1995,13 @@ update_modpack() {
 	local mod_id="" mod_name="" known_file=""
 	local file_id meta display versions answer
 	local staged work root generated status=0
-	local was_running=0
+	local was_running=0 keep_world=1 world_status=0
 
 	if [[ -z "$name" ]]; then
 		echo "Error: missing modpack name." >&2
 		return 1
 	fi
-	if ! valid_modpack_name "$name"; then
-		echo "Error: '$name' is not a modpack name." >&2
-		return 1
-	fi
+	require_modpack "$name" || return 1
 	if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
 		echo "Error: update needs curl and python3." >&2
 		return 1
@@ -1751,6 +2021,12 @@ update_modpack() {
 	if picked="$(read_curseforge_id "$id_file")"; then
 		IFS=$'\t' read -r mod_id known_file <<<"$picked"
 		mod_name="$name"
+	elif [[ -n "${MODMAN_MOD_ID:-}" ]]; then
+		mod_id="$MODMAN_MOD_ID"
+		mod_name="$name"
+	elif [[ "${MODMAN_YES:-}" == "1" ]]; then
+		echo "Error: no CurseForge id in ${id_file}. Choose the modpack in the webpage search." >&2
+		return 1
 	else
 		echo "No CurseForge id in ${id_file}."
 		echo "Searching CurseForge for '${name}'..."
@@ -1758,7 +2034,13 @@ update_modpack() {
 		if ((select_status == 2)); then
 			echo "Search by the name used on CurseForge."
 			select_status=0
-			picked="$(cf_prompt_modpack_query)" || return 1
+			picked="$(cf_prompt_modpack_query)" || select_status=$?
+			if ((select_status == 3)); then
+				return 0
+			fi
+			if ((select_status != 0)); then
+				return 1
+			fi
 			picked="$(cf_select_modpack "$key" "$picked")" || select_status=$?
 		fi
 		if ((select_status == 2 || select_status == 3)); then
@@ -1784,12 +2066,28 @@ update_modpack() {
 	else
 		echo "Update ${name} to ${display}?"
 	fi
-	echo "The world, server.properties, ops, whitelist, bans, and eula.txt are kept."
+	cf_prompt_world_choice "$dest" || world_status=$?
+	if ((world_status == 3)); then
+		return 0
+	fi
+	if ((world_status != 0 && world_status != 2)); then
+		return 1
+	fi
+	if ((world_status == 2)); then
+		keep_world=0
+	fi
+	if ((keep_world)); then
+		echo "The world, server.properties, ops, whitelist, bans, and eula.txt are kept."
+	else
+		echo "The world will be deleted. server.properties, ops, whitelist, bans, and eula.txt are kept."
+	fi
 	if is_running "$name"; then
 		was_running=1
 		echo "The server is running and will be stopped first."
 	fi
-	if ! read -r -e -p "Type yes to confirm: " answer; then
+	if [[ "${MODMAN_YES:-}" == "1" ]]; then
+		answer=yes
+	elif ! read -r -e -p "Type yes to confirm: " answer; then
 		echo
 		return 1
 	fi
@@ -1808,7 +2106,7 @@ update_modpack() {
 		IFS= read -r root
 		IFS= read -r generated
 	} <<<"$staged"
-	if ! cf_replace_pack "$name" "$root"; then
+	if ! cf_replace_pack "$name" "$root" "$keep_world"; then
 		rm -rf "$work"
 		return 1
 	fi
@@ -1826,6 +2124,8 @@ update_modpack() {
 	echo "Updated '${name}' in ${dest}"
 	if [[ "$generated" == "generated" ]]; then
 		echo "Wrote start.sh; the server pack did not include one."
+	elif [[ "$generated" == renamed\ * ]]; then
+		echo "Renamed ${generated#renamed } to start.sh."
 	fi
 	echo "CurseForge project id ${mod_id} saved in ${dest}/.curseforge-id"
 	if ((was_running)); then
@@ -1853,6 +2153,853 @@ require_two_args() {
 }
 
 # Returns 2 for exit so the REPL can leave; 0 on success; 1 on error.
+# Remember an explicit start or stop. The unit exits after launching screens,
+# so systemd reports it inactive even when that start succeeded.
+web_service_mark() {
+	local word="$1"
+	printf '%s\n' "$word" >"$WEB_SERVICE_STATE_FILE"
+}
+
+# active when systemd says so, or when the last successful start has not been
+# followed by a stop.
+web_service_activity() {
+	local live result status saved
+	local inactive_exit active_exit file_epoch exit_epoch
+	live="$(systemctl is-active "$SYSTEMD_SERVICE" 2>/dev/null || true)"
+	case "$live" in
+	active|activating|reloading)
+		printf '%s' "active"
+		return
+		;;
+	failed)
+		printf '%s' "failed"
+		return
+		;;
+	esac
+	if [[ -f "$WEB_SERVICE_STATE_FILE" ]]; then
+		inactive_exit="$(systemctl show -p InactiveExitTimestamp --value "$SYSTEMD_SERVICE" 2>/dev/null || true)"
+		file_epoch="$(stat -c %Y "$WEB_SERVICE_STATE_FILE" 2>/dev/null || echo 0)"
+		exit_epoch=0
+		if [[ -n "$inactive_exit" && "$inactive_exit" != "n/a" ]]; then
+			exit_epoch="$(date -d "$inactive_exit" +%s 2>/dev/null || echo 0)"
+		fi
+		if ((file_epoch >= exit_epoch)); then
+			IFS= read -r saved <"$WEB_SERVICE_STATE_FILE" || true
+			case "$saved" in
+			active|inactive|failed)
+				printf '%s' "$saved"
+				return
+				;;
+			esac
+		fi
+	fi
+	result="$(systemctl show -p Result --value "$SYSTEMD_SERVICE" 2>/dev/null || true)"
+	status="$(systemctl show -p ExecMainStatus --value "$SYSTEMD_SERVICE" 2>/dev/null || true)"
+	active_exit="$(systemctl show -p ActiveExitTimestampMonotonic --value "$SYSTEMD_SERVICE" 2>/dev/null || echo 0)"
+	inactive_exit="$(systemctl show -p InactiveExitTimestampMonotonic --value "$SYSTEMD_SERVICE" 2>/dev/null || echo 0)"
+	[[ "$active_exit" =~ ^[0-9]+$ ]] || active_exit=0
+	[[ "$inactive_exit" =~ ^[0-9]+$ ]] || inactive_exit=0
+	if [[ "$result" == "success" && "$status" == "0" && "$inactive_exit" -gt 0 && "$inactive_exit" -ge "$active_exit" ]]; then
+		printf '%s' "active"
+		return
+	fi
+	if [[ -n "$live" ]]; then
+		printf '%s' "$live"
+	else
+		printf '%s' "unknown"
+	fi
+}
+
+web_pack_row() {
+	local file="$1"
+	local indexed="$2"
+	local name="$3"
+	local java port status cpu ram uptime curse=0
+
+	java="$(get_java_version "$name")"
+	port="$(get_port "$name")"
+	if [[ -d "$MINECRAFT_ROOT/$name" ]]; then
+		status="$(display_status "$name")"
+		{
+			read -r cpu
+			read -r ram
+			read -r uptime
+		} < <(pack_usage_cells "$name")
+		if [[ -f "$MINECRAFT_ROOT/$name/.curseforge-id" ]]; then
+			curse=1
+		fi
+	else
+		status="stopped"
+		cpu="-"
+		ram="-"
+		uptime="-"
+	fi
+	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" >>"$file"
+}
+
+web_json_packs() {
+	local file name active enabled
+	local -A seen=()
+	file="$(mktemp)"
+	read_index
+	for name in "${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}"; do
+		[[ -n "$name" ]] || continue
+		web_pack_row "$file" 1 "$name"
+		seen["$name"]=1
+	done
+	while IFS= read -r name; do
+		[[ -n "$name" ]] || continue
+		[[ -n "${seen[$name]:-}" ]] && continue
+		web_pack_row "$file" 0 "$name"
+	done < <(all_modpack_names || true)
+	active="$(web_service_activity)"
+	enabled="$(systemctl is-enabled "$SYSTEMD_SERVICE" 2>/dev/null || true)"
+	[[ -n "$active" ]] || active="unknown"
+	[[ -n "$enabled" ]] || enabled="unknown"
+	local status=0
+	python3 - "$file" "$active" "$enabled" <<'PY' || status=$?
+import json, sys
+rows = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        parts = line.rstrip("\n").split("\x1f")
+        if len(parts) != 9:
+            continue
+        indexed, name, java, port, status, cpu, ram, uptime, curse = parts
+        rows.append({
+            "indexed": indexed == "1",
+            "name": name,
+            "java": java,
+            "port": port,
+            "status": status,
+            "cpu": cpu,
+            "ram": ram,
+            "uptime": uptime,
+            "curseforge": curse == "1",
+        })
+print(json.dumps({
+    "packs": rows,
+    "service": {"active": sys.argv[2], "enabled": sys.argv[3]},
+}))
+PY
+	rm -f "$file"
+	return "$status"
+}
+
+web_show_log() {
+	local name="${1:-}"
+	local log
+	require_modpack "$name" || return 1
+	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	log="$MINECRAFT_ROOT/$name/logs/latest.log"
+	if [[ ! -f "$log" ]]; then
+		echo "No log yet."
+		return 0
+	fi
+	tail -n 200 "$log"
+}
+
+web_search() {
+	local query="${1:-}"
+	local key tsv file status=0
+	query="${query#"${query%%[![:space:]]*}"}"
+	query="${query%"${query##*[![:space:]]}"}"
+	if [[ -z "$query" ]]; then
+		echo "Error: enter a modpack name." >&2
+		return 1
+	fi
+	key="$(read_curseforge_key)" || return 1
+	tsv="$(cf_search_modpacks "$key" "$query")" || return 1
+	file="$(mktemp)"
+	printf '%s\n' "$tsv" >"$file"
+	python3 - "$file" <<'PY' || status=$?
+import json, sys
+rows = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        while len(parts) < 4:
+            parts.append("")
+        mod_id, name, downloads, summary = parts[:4]
+        rows.append({
+            "id": mod_id,
+            "name": name,
+            "downloads": downloads,
+            "summary": summary,
+        })
+print(json.dumps(rows))
+PY
+	rm -f "$file"
+	return "$status"
+}
+
+web_install() {
+	local mod_id="${1:-}"
+	local key name
+	if [[ ! "$mod_id" =~ ^[0-9]+$ ]]; then
+		echo "Error: bad CurseForge project id." >&2
+		return 1
+	fi
+	key="$(read_curseforge_key)" || return 1
+	name="$(cf_mod_name "$key" "$mod_id")" || {
+		echo "Error: could not read that CurseForge project." >&2
+		return 1
+	}
+	install_chosen_modpack "$mod_id" "$name"
+}
+
+web_update() {
+	local name="${1:-}"
+	local world="${2:-}"
+	local confirm="${3:-}"
+	local delete_confirm="${4:-}"
+	local mod_id="${5:-}"
+	if ! valid_modpack_name "$name"; then
+		echo "Error: '$name' is not a modpack name." >&2
+		return 1
+	fi
+	if [[ "$confirm" != "yes" ]]; then
+		echo "Error: type yes to update." >&2
+		return 1
+	fi
+	case "$world" in
+	keep)
+		;;
+	delete)
+		if [[ "$delete_confirm" != "yes" ]]; then
+			echo "Error: type yes to delete the world." >&2
+			return 1
+		fi
+		;;
+	*)
+		echo "Error: world must be keep or delete." >&2
+		return 1
+		;;
+	esac
+	if [[ -n "$mod_id" && ! "$mod_id" =~ ^[0-9]+$ ]]; then
+		echo "Error: bad CurseForge project id." >&2
+		return 1
+	fi
+	MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_MOD_ID="$mod_id" update_modpack "$name"
+}
+
+web_run() {
+	local cmd="${1:-}"
+	shift || true
+	case "$cmd" in
+	start|stop|restart)
+		if [[ -n "${1:-}" ]] && ! valid_modpack_name "$1"; then
+			echo "Error: '$1' is not a modpack name." >&2
+			return 1
+		fi
+		case "$cmd" in
+		start) start_servers "${1:-}" ;;
+		stop) stop_servers "${1:-}" ;;
+		restart) restart_servers "${1:-}" ;;
+		esac
+		;;
+	enable)
+		add_modpack "${1:-}"
+		;;
+	disable)
+		remove_modpack "${1:-}"
+		;;
+	port)
+		set_port "${1:-}" "${2:-}"
+		;;
+	uninstall)
+		if ! valid_modpack_name "${1:-}"; then
+			echo "Error: '${1:-}' is not a modpack name." >&2
+			return 1
+		fi
+		if [[ "${2:-}" != "yes" ]]; then
+			echo "Error: type yes to uninstall." >&2
+			return 1
+		fi
+		MODMAN_YES=1 uninstall_modpack "$1"
+		;;
+	service)
+		case "${1:-}" in
+		status|start|stop|restart|enable|disable)
+			service_control "$1"
+			;;
+		*)
+			echo "Error: unknown service action '${1:-}'." >&2
+			return 1
+			;;
+		esac
+		;;
+	*)
+		echo "Error: unknown action '$cmd'." >&2
+		return 1
+		;;
+	esac
+}
+
+web_call() {
+	local op="${1:-}"
+	shift || true
+	case "$op" in
+	packs) web_json_packs ;;
+	log) web_show_log "${1:-}" ;;
+	search) web_search "${1:-}" ;;
+	install) web_install "${1:-}" ;;
+	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+	run) web_run "$@" ;;
+	*)
+		echo "Error: unknown web call." >&2
+		return 1
+		;;
+	esac
+}
+
+web_read_state() {
+	WEB_PID=""
+	WEB_PORT_SAVED=""
+	[[ -f "$WEB_STATE_FILE" ]] || return 1
+	local line key val
+	WEB_HTTP_PORT_SAVED="$WEB_HTTP_PORT"
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		key="${line%%=*}"
+		val="${line#*=}"
+		case "$key" in
+		pid) WEB_PID="$val" ;;
+		port) WEB_PORT_SAVED="$val" ;;
+		http_port)
+			if [[ "$val" =~ ^[0-9]+$ ]]; then
+				WEB_HTTP_PORT_SAVED="$val"
+			fi
+			;;
+		esac
+	done <"$WEB_STATE_FILE"
+	[[ "$WEB_PID" =~ ^[0-9]+$ ]] || return 1
+	[[ "$WEB_PORT_SAVED" =~ ^[0-9]+$ ]] || WEB_PORT_SAVED="$WEB_PORT"
+}
+
+web_is_running() {
+	web_read_state || return 1
+	kill -0 "$WEB_PID" 2>/dev/null
+}
+
+web_print_links() {
+	local https_port="$1"
+	local http_port="${2:-$WEB_HTTP_PORT}"
+	local ip found=0 domain=""
+	if [[ -s "$WEB_DOMAIN_FILE" ]]; then
+		domain="$(head -n 1 "$WEB_DOMAIN_FILE" | tr -d '[:space:]')"
+	fi
+	if [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$domain" == *.* ]]; then
+		echo "https://${domain}/"
+	fi
+	while IFS= read -r ip; do
+		[[ -n "$ip" ]] || continue
+		[[ "$ip" == 127.* ]] && continue
+		[[ "$ip" == *:* ]] && continue
+		echo "https://${ip}:${https_port}/"
+		found=1
+	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+	if ((found == 0)); then
+		echo "https://127.0.0.1:${https_port}/"
+	else
+		echo "On this machine: https://127.0.0.1:${https_port}/"
+	fi
+	echo "HTTP fallback:"
+	found=0
+	while IFS= read -r ip; do
+		[[ -n "$ip" ]] || continue
+		[[ "$ip" == 127.* ]] && continue
+		[[ "$ip" == *:* ]] && continue
+		echo "http://${ip}:${http_port}/"
+		found=1
+	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+	if ((found == 0)); then
+		echo "http://127.0.0.1:${http_port}/"
+	else
+		echo "On this machine: http://127.0.0.1:${http_port}/"
+	fi
+	echo "Certificate:"
+	found=0
+	while IFS= read -r ip; do
+		[[ -n "$ip" ]] || continue
+		[[ "$ip" == 127.* ]] && continue
+		[[ "$ip" == *:* ]] && continue
+		echo "http://${ip}:${http_port}/modman-ca.crt"
+		found=1
+	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+	if ((found == 0)); then
+		echo "http://127.0.0.1:${http_port}/modman-ca.crt"
+	else
+		echo "On this machine: http://127.0.0.1:${http_port}/modman-ca.crt"
+	fi
+}
+
+web_cert_names() {
+	local san="DNS:localhost,IP:127.0.0.1" ip name
+	while IFS= read -r ip; do
+		[[ -n "$ip" ]] || continue
+		[[ "$ip" == *:* ]] && continue
+		san+=",IP:${ip}"
+	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+	name="$(hostname -f 2>/dev/null || true)"
+	if [[ "$name" =~ ^[A-Za-z0-9.-]+$ && "$name" != "localhost" ]]; then
+		san+=",DNS:${name}"
+	fi
+	printf '%s' "$san"
+}
+
+web_cert_ok() {
+	local text ip
+	[[ -s "$WEB_CERT_FILE" && -s "$WEB_KEY_FILE" && -s "$WEB_CA_FILE" && -s "$WEB_CA_KEY_FILE" ]] || return 1
+	openssl verify -CAfile "$WEB_CA_FILE" "$WEB_CERT_FILE" >/dev/null 2>&1 || return 1
+	text="$(openssl x509 -in "$WEB_CERT_FILE" -noout -text 2>/dev/null || true)"
+	[[ "$text" == *'CA:FALSE'* ]] || return 1
+	[[ "$text" == *'TLS Web Server Authentication'* ]] || return 1
+	[[ "$text" == *'IP Address:127.0.0.1'* ]] || return 1
+	while IFS= read -r ip; do
+		[[ -n "$ip" ]] || continue
+		[[ "$ip" == *:* ]] && continue
+		[[ "$ip" == 127.* ]] && continue
+		[[ "$text" == *"IP Address:${ip}"* ]] || return 1
+	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+	return 0
+}
+
+web_ensure_ca() {
+	local text not_before not_after
+	if [[ -s "$WEB_CA_FILE" && -s "$WEB_CA_KEY_FILE" ]]; then
+		text="$(openssl x509 -in "$WEB_CA_FILE" -noout -text 2>/dev/null || true)"
+		[[ "$text" == *'CA:TRUE'* ]] && return 0
+	fi
+	not_before="$(date -u -d '2 days ago' +%Y%m%d%H%M%SZ)"
+	not_after="$(date -u -d '10 years' +%Y%m%d%H%M%SZ)"
+	umask 077
+	if ! openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+		-keyout "$WEB_CA_KEY_FILE" -out "$WEB_CA_FILE" \
+		-not_before "$not_before" -not_after "$not_after" \
+		-subj /CN=modman \
+		-addext basicConstraints=critical,CA:TRUE \
+		-addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1; then
+		rm -f "$WEB_CA_FILE" "$WEB_CA_KEY_FILE"
+		echo "Error: could not create the https certificate." >&2
+		return 1
+	fi
+	chmod 600 "$WEB_CA_KEY_FILE"
+	chmod 644 "$WEB_CA_FILE"
+}
+
+web_ensure_cert() {
+	local san cfg keytmp csrtmp certtmp serial not_before not_after
+	if web_cert_ok; then
+		return 0
+	fi
+	if ! command -v openssl >/dev/null 2>&1; then
+		echo "Error: https needs openssl to make a certificate." >&2
+		return 1
+	fi
+	web_ensure_ca || return 1
+	san="$(web_cert_names)"
+	cfg="$(mktemp)"
+	keytmp="$(mktemp)"
+	csrtmp="$(mktemp)"
+	certtmp="$(mktemp)"
+	serial="${cfg}.srl"
+	not_before="$(date -u -d '2 days ago' +%Y%m%d%H%M%SZ)"
+	not_after="$(date -u -d '390 days' +%Y%m%d%H%M%SZ)"
+	cat >"$cfg" <<EOF
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = ${san}
+EOF
+	umask 077
+	if ! openssl req -newkey rsa:2048 -sha256 -nodes \
+		-keyout "$keytmp" -out "$csrtmp" \
+		-subj /CN=modman >/dev/null 2>&1 \
+		|| ! openssl x509 -req -in "$csrtmp" \
+			-CA "$WEB_CA_FILE" -CAkey "$WEB_CA_KEY_FILE" -CAserial "$serial" -CAcreateserial \
+			-out "$certtmp" -sha256 \
+			-not_before "$not_before" -not_after "$not_after" \
+			-extfile "$cfg" >/dev/null 2>&1; then
+		rm -f "$cfg" "$keytmp" "$csrtmp" "$certtmp" "$serial"
+		echo "Error: could not create the https certificate." >&2
+		return 1
+	fi
+	rm -f "$cfg" "$csrtmp" "$serial"
+	mv "$keytmp" "$WEB_KEY_FILE"
+	mv "$certtmp" "$WEB_CERT_FILE"
+	chmod 600 "$WEB_KEY_FILE"
+	chmod 644 "$WEB_CERT_FILE"
+}
+
+# Ask sudo to trust the certificate on this computer. A browser on another
+# computer still needs the certificate file from the http link.
+web_trust_ca() {
+	local dest="/usr/local/share/ca-certificates/modman-web.crt"
+	if [[ -r /etc/ssl/certs/ca-certificates.crt ]] \
+		&& openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$WEB_CERT_FILE" >/dev/null 2>&1; then
+		echo "This computer trusts the https certificate."
+		return 0
+	fi
+	echo "Trusting the https certificate on this computer."
+	if command -v sudo >/dev/null 2>&1 \
+		&& sudo bash -c 'cp "$1" "$2" && update-ca-certificates' bash "$WEB_CA_FILE" "$dest" >/dev/null; then
+		echo "This computer trusts the https certificate."
+		return 0
+	fi
+	echo "This computer did not trust the certificate."
+	echo "Install it from a certificate link below, then open an https link."
+	echo "If the browser shows a certificate error and no way to continue, click the page and type thisisunsafe."
+}
+
+web_write_helper() {
+	local helper_tmp wrote=0
+	helper_tmp="$(mktemp "${TMPDIR:-/tmp}/modman-web.XXXXXX")"
+	cat >"$helper_tmp" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+hash_file=$(printf '%q' "$WEB_HASH_FILE")
+cert_file=$(printf '%q' "$WEB_CERT_FILE")
+key_file=$(printf '%q' "$WEB_KEY_FILE")
+modman_bin=$(printf '%q' "${SCRIPT_DIR}/modman")
+web_py=$(printf '%q' "$WEB_PY")
+state_file=$(printf '%q' "$WEB_STATE_FILE")
+port=$WEB_PORT
+http_port=$WEB_HTTP_PORT
+if [[ ! -s "\$hash_file" ]]; then
+	echo "Error: missing webpage password hash: \$hash_file" >&2
+	echo "Run web install to set it." >&2
+	exit 1
+fi
+if [[ ! -s "\$cert_file" || ! -s "\$key_file" ]]; then
+	echo "Error: missing https certificate." >&2
+	echo "Run web start so modman can create one." >&2
+	exit 1
+fi
+passfile="\$(mktemp)"
+chmod 600 "\$passfile"
+cp "\$hash_file" "\$passfile"
+printf 'pid=%s\\nport=%s\\nhttp_port=%s\\n' "\$\$" "\$port" "\$http_port" >"\$state_file"
+MODMAN_WEB_CERT="\$cert_file" \\
+	MODMAN_WEB_KEY="\$key_file" \\
+	MODMAN_WEB_PASSWORD_FILE="\$passfile" \\
+	MODMAN_BIN="\$modman_bin" \\
+	MODMAN_WEB_PORT="\$port" \\
+	MODMAN_WEB_HTTP_PORT="\$http_port" \\
+	exec python3 "\$web_py"
+EOF
+	chmod 755 "$helper_tmp"
+	if install_system_file "$helper_tmp" "$WEB_SYSTEMD_HELPER"; then
+		wrote=1
+	fi
+	rm -f "$helper_tmp"
+	((wrote))
+}
+
+web_save_hash() {
+	local hash="$1" old_umask
+	old_umask="$(umask)"
+	umask 077
+	if ! printf '%s\n' "$hash" >"$WEB_HASH_FILE"; then
+		umask "$old_umask"
+		return 1
+	fi
+	chmod 600 "$WEB_HASH_FILE"
+	umask "$old_umask"
+}
+
+web_start() {
+	local password passfile pid i hash
+	if web_is_running; then
+		echo "The webpage is already running."
+		web_print_links "$WEB_PORT_SAVED" "$WEB_HTTP_PORT_SAVED"
+		return 0
+	fi
+	if web_unit_active; then
+		echo "The webpage is already running."
+		web_print_links "$WEB_PORT" "$WEB_HTTP_PORT"
+		return 0
+	fi
+	rm -f "$WEB_STATE_FILE"
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "Error: the webpage needs python3." >&2
+		return 1
+	fi
+	if [[ ! -f "$WEB_PY" ]]; then
+		echo "Error: missing $WEB_PY" >&2
+		return 1
+	fi
+	web_ensure_cert || return 1
+	web_trust_ca || true
+	echo "http on port ${WEB_HTTP_PORT} works before a browser will open https."
+	if ! read -r -s -p "Password for the webpage: " password; then
+		echo
+		return 1
+	fi
+	echo
+	if [[ -z "$password" ]]; then
+		echo "Error: password cannot be empty." >&2
+		return 1
+	fi
+	if ! hash="$(printf '%s' "$password" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; then
+		unset password
+		echo "Error: could not hash the password." >&2
+		return 1
+	fi
+	unset password
+	if [[ -f "$WEB_SYSTEMD_UNIT" || -f "$WEB_HASH_FILE" ]]; then
+		if ! web_save_hash "$hash"; then
+			unset hash
+			echo "Error: failed to write $WEB_HASH_FILE" >&2
+			return 1
+		fi
+	fi
+	if [[ -f "$WEB_SYSTEMD_UNIT" ]]; then
+		unset hash
+		echo "Starting $WEB_SYSTEMD_SERVICE..."
+		web_write_helper || return 1
+		run_systemctl start "$WEB_SYSTEMD_SERVICE" || return 1
+		for i in $(seq 1 50); do
+			if web_is_running; then
+				echo "The webpage is running."
+				web_print_links "$WEB_PORT_SAVED" "$WEB_HTTP_PORT_SAVED"
+				return 0
+			fi
+			sleep 0.1
+		done
+		echo "Error: the webpage did not start in time." >&2
+		return 1
+	fi
+	passfile="$(mktemp)"
+	chmod 600 "$passfile"
+	printf '%s' "$hash" >"$passfile"
+	unset hash
+	: >"$WEB_LOG_FILE"
+	# The file holds the password hash, not the password, and not on the command line.
+	MODMAN_WEB_CERT="$WEB_CERT_FILE" \
+		MODMAN_WEB_KEY="$WEB_KEY_FILE" \
+		MODMAN_WEB_PASSWORD_FILE="$passfile" \
+		MODMAN_BIN="${SCRIPT_DIR}/modman" \
+		MODMAN_WEB_PORT="$WEB_PORT" \
+		MODMAN_WEB_HTTP_PORT="$WEB_HTTP_PORT" \
+		nohup python3 "$WEB_PY" >>"$WEB_LOG_FILE" 2>&1 </dev/null &
+	pid=$!
+	disown "$pid" 2>/dev/null || true
+	printf 'pid=%s\nport=%s\nhttp_port=%s\n' "$pid" "$WEB_PORT" "$WEB_HTTP_PORT" >"$WEB_STATE_FILE"
+	for i in $(seq 1 50); do
+		if grep -q '^listening ' "$WEB_LOG_FILE" 2>/dev/null; then
+			rm -f "$passfile"
+			echo "The webpage is running."
+			web_print_links "$WEB_PORT" "$WEB_HTTP_PORT"
+			return 0
+		fi
+		if ! kill -0 "$pid" 2>/dev/null; then
+			rm -f "$passfile" "$WEB_STATE_FILE"
+			echo "Error: the webpage failed to start." >&2
+			if [[ -s "$WEB_LOG_FILE" ]]; then
+				cat "$WEB_LOG_FILE" >&2
+			fi
+			return 1
+		fi
+		sleep 0.1
+	done
+	kill "$pid" 2>/dev/null || true
+	rm -f "$passfile" "$WEB_STATE_FILE"
+	echo "Error: the webpage did not start in time. See $WEB_LOG_FILE" >&2
+	return 1
+}
+
+web_unit_active() {
+	[[ "$(systemctl is-active "$WEB_SYSTEMD_SERVICE" 2>/dev/null || true)" == "active" ]]
+}
+
+web_stop() {
+	local i stopped=0
+	if web_unit_active; then
+		echo "Stopping $WEB_SYSTEMD_SERVICE..."
+		run_systemctl stop "$WEB_SYSTEMD_SERVICE" || return 1
+		stopped=1
+	fi
+	if ! web_is_running; then
+		rm -f "$WEB_STATE_FILE"
+		if ((stopped)); then
+			echo "Stopped the webpage."
+			return 0
+		fi
+		echo "The webpage is not running."
+		return 0
+	fi
+	kill "$WEB_PID" 2>/dev/null || true
+	for i in $(seq 1 25); do
+		kill -0 "$WEB_PID" 2>/dev/null || break
+		sleep 0.2
+	done
+	if kill -0 "$WEB_PID" 2>/dev/null; then
+		kill -9 "$WEB_PID" 2>/dev/null || true
+	fi
+	rm -f "$WEB_STATE_FILE"
+	echo "Stopped the webpage."
+}
+
+web_restart() {
+	if web_is_running || web_unit_active; then
+		web_stop || return 1
+	fi
+	web_start
+}
+
+web_status() {
+	if web_is_running; then
+		echo "The webpage is running."
+		web_print_links "$WEB_PORT_SAVED" "$WEB_HTTP_PORT_SAVED"
+		return 0
+	fi
+	rm -f "$WEB_STATE_FILE"
+	echo "The webpage is not running."
+}
+
+web_install() {
+	local user password hash unit_tmp
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "Error: the webpage needs python3." >&2
+		return 1
+	fi
+	if ! command -v systemctl >/dev/null 2>&1; then
+		echo "Error: systemctl is not available." >&2
+		return 1
+	fi
+	if [[ ! -f "$WEB_PY" ]]; then
+		echo "Error: missing $WEB_PY" >&2
+		return 1
+	fi
+	user="$(service_user "$WEB_SYSTEMD_SERVICE")" || return 1
+
+	echo "The boot service keeps a hash of this password. The password itself is not stored."
+	if ! read -r -s -p "Password for the webpage: " password; then
+		echo
+		return 1
+	fi
+	echo
+	if [[ -z "$password" ]]; then
+		echo "Error: password cannot be empty." >&2
+		return 1
+	fi
+	if ! hash="$(printf '%s' "$password" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; then
+		unset password
+		echo "Error: could not hash the password." >&2
+		return 1
+	fi
+	unset password
+	if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+		unset hash
+		echo "Error: could not hash the password." >&2
+		return 1
+	fi
+	if ! web_save_hash "$hash"; then
+		unset hash
+		echo "Error: failed to write $WEB_HASH_FILE" >&2
+		return 1
+	fi
+	unset hash
+
+	echo "Installing $WEB_SYSTEMD_SERVICE for user $user..."
+	unit_tmp="$(mktemp "${TMPDIR:-/tmp}/modman-web.service.XXXXXX")"
+	# shellcheck disable=SC2064
+	trap "rm -f $(printf '%q' "$unit_tmp")" RETURN
+
+	cat >"$unit_tmp" <<EOF
+[Unit]
+Description=modman control page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+WorkingDirectory=${ROOT_DIR}
+ExecStart=${WEB_SYSTEMD_HELPER}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+	if ! web_write_helper; then
+		return 1
+	fi
+	if ! install_system_file "$unit_tmp" "$WEB_SYSTEMD_UNIT"; then
+		return 1
+	fi
+	echo "Installed $WEB_SYSTEMD_UNIT (User=$user)."
+	echo "Installed $WEB_SYSTEMD_HELPER."
+	run_systemctl daemon-reload || return 1
+	echo "$WEB_SYSTEMD_SERVICE installed. It was not enabled or started."
+	echo "Run 'web enable' to start it at boot, or 'web start' to start it now."
+}
+
+web_enable() {
+	if [[ ! -f "$WEB_SYSTEMD_UNIT" ]]; then
+		echo "Error: $WEB_SYSTEMD_SERVICE is not installed. Run web install first." >&2
+		return 1
+	fi
+	web_ensure_cert || return 1
+	web_trust_ca || true
+	web_write_helper || return 1
+	echo "Enabling $WEB_SYSTEMD_SERVICE to start at boot..."
+	run_systemctl enable "$WEB_SYSTEMD_SERVICE" || return 1
+	echo "$WEB_SYSTEMD_SERVICE enabled. It was not started."
+}
+
+web_disable() {
+	echo "Disabling $WEB_SYSTEMD_SERVICE from starting at boot..."
+	run_systemctl disable "$WEB_SYSTEMD_SERVICE" || return 1
+	echo "$WEB_SYSTEMD_SERVICE disabled. The webpage was left up."
+}
+
+web_control() {
+	local action="${1:-}"
+	if (($# > 1)); then
+		echo "Error: 'web' takes one action: start, stop, restart, status, enable, disable, or install." >&2
+		return 1
+	fi
+	case "$action" in
+	start)
+		web_start
+		;;
+	stop)
+		web_stop
+		;;
+	restart)
+		web_restart
+		;;
+	status)
+		web_status
+		;;
+	enable)
+		web_enable
+		;;
+	disable)
+		web_disable
+		;;
+	install)
+		web_install
+		;;
+	"")
+		echo "Error: 'web' requires start, stop, restart, status, enable, disable, or install." >&2
+		return 1
+		;;
+	*)
+		echo "Error: unknown web action '$action'." >&2
+		return 1
+		;;
+	esac
+}
+
 dispatch() {
 	if (($# == 0)); then
 		return 0
@@ -1920,6 +3067,9 @@ dispatch() {
 			require_two_args "$cmd" "${1:-}" "${2:-}" || return 1
 			set_port "$1" "$2" || return 1
 			;;
+		web)
+			web_control "$@" || return 1
+			;;
 		*)
 			echo "Error: unknown command '$cmd'. Type help for commands." >&2
 			return 1
@@ -1966,7 +3116,7 @@ _repl_candidates() {
 	local -a words=()
 
 	if ((cword == 0)); then
-		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port help exit
+		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port web help exit
 		return 0
 	fi
 
@@ -1974,6 +3124,11 @@ _repl_candidates() {
 		service)
 			if ((cword == 1)); then
 				_ci_matches "$cur" status start stop restart enable disable install
+			fi
+			;;
+		web)
+			if ((cword == 1)); then
+				_ci_matches "$cur" start stop restart status enable disable install
 			fi
 			;;
 		enable)
@@ -2120,6 +3275,18 @@ repl() {
 		fi
 	done
 }
+
+if [[ "${1:-}" == "--web-call" ]]; then
+	shift
+	web_call "$@"
+	exit $?
+fi
+
+if [[ "${1:-}" == "--web" || "${1:-}" == "-w" ]]; then
+	shift
+	web_control "$@"
+	exit $?
+fi
 
 main() {
 	if (($# > 0)); then

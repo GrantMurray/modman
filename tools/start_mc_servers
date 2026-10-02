@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Started by mc-servers.service. Launches each indexed modpack that is not
+# already running. Paths are filled in by `service install`.
+INDEX_FILE="__INDEX_FILE__"
+MINECRAFT_ROOT="__MINECRAFT_ROOT__"
+
+if [[ ! -f "$INDEX_FILE" ]]; then
+	echo "Index not found: $INDEX_FILE" >&2
+	exit 1
+fi
+
+mapfile -t servers < <(grep -v '^[[:space:]]*$' "$INDEX_FILE" || true)
+
+for server_name in "${servers[@]}"; do
+	if [[ ! "$server_name" =~ ^[A-Za-z0-9._-]+$ || "$server_name" == "." || "$server_name" == ".." || "$server_name" == *..* ]]; then
+		echo "Skipping unsafe modpack name: $server_name" >&2
+		continue
+	fi
+	if [[ -L "${MINECRAFT_ROOT}/${server_name}" ]]; then
+		echo "Skipping symlink: $server_name" >&2
+		continue
+	fi
+	if [[ -e "${MINECRAFT_ROOT}/${server_name}" ]]; then
+		real_root="$(realpath -e "$MINECRAFT_ROOT" 2>/dev/null || true)"
+		real_dest="$(realpath -e "${MINECRAFT_ROOT}/${server_name}" 2>/dev/null || true)"
+		if [[ -z "$real_root" || "$real_dest" != "$real_root/$server_name" ]]; then
+			echo "Skipping modpack outside ${MINECRAFT_ROOT}: $server_name" >&2
+			continue
+		fi
+	fi
+	if ! screen -list | grep -q "mc-${server_name}"; then
+		echo "Starting screen/server mc-${server_name}..."
+		screen -dmS "mc-${server_name}" bash -c "cd \"${MINECRAFT_ROOT}/${server_name}\" && ./start.sh"
+	fi
+done
