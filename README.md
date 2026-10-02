@@ -1,30 +1,140 @@
 # modman
 
-modman manages several Minecraft modpacks on one computer. You run it from a prompt and type commands.
+modman manages several Minecraft modpack servers on one Linux computer. You run it from a prompt and type commands. It can:
 
-## Install it
+- install and update server packs from CurseForge
+- start, stop, and restart each server in its own `screen` session
+- start a chosen set of servers when the computer boots
+- show status, CPU, memory, uptime, and port conflicts
+- serve a password-protected control page you can open from a phone or another computer
 
-Put this project folder somewhere permanent. The `bin`, `tools`, and `data` folders need to stay next to each other. `bin` holds `modman`. The other programs live in `tools`, off your `PATH`.
+## Requirements
 
-This example uses `~/.local/share/modman`. Use the path you actually chose.
+- Linux with systemd. These steps use Debian or Ubuntu commands.
+- bash, `screen`, Python 3.7 or newer, `curl`, `openssl`, and `sudo`.
+- Java for the servers. The version depends on the Minecraft version of each pack:
 
-Make the program executable:
+  | Minecraft | Java |
+  | --- | --- |
+  | 1.16.5 and older | 8 |
+  | 1.18 to 1.20.4 | 17 |
+  | 1.20.5 to 1.21.x | 21 |
+
+  For newer versions, check the pack's page for the Java it needs.
+- A CurseForge API key, only if you want `install` and `update`.
+
+## Set it up from scratch
+
+### 1. Install the dependencies
 
 ```bash
+sudo apt update
+sudo apt install -y git screen python3 curl openssl ca-certificates sudo openjdk-21-jre-headless
+```
+
+If your distribution does not package the Java version a pack needs (Debian 13 has no Java 17, for example), install it from [Adoptium](https://adoptium.net):
+
+```bash
+sudo apt install -y wget gpg
+wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/adoptium.gpg >/dev/null
+echo "deb https://packages.adoptium.net/artifactory/deb $(awk -F= '/^VERSION_CODENAME/{print $2}' /etc/os-release) main" | sudo tee /etc/apt/sources.list.d/adoptium.list
+sudo apt update
+sudo apt install -y temurin-17-jre
+```
+
+Check what is installed with `java -version`. When several are installed, a pack's `start.sh` can name one by full path, for example `/usr/lib/jvm/temurin-17-jre-amd64/bin/java`.
+
+### 2. Get modman
+
+```bash
+git clone https://github.com/GrantMurray/modman.git ~/.local/share/modman
 chmod +x ~/.local/share/modman/bin/modman
+echo 'export PATH="$HOME/.local/share/modman/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-Add that `bin` folder to your `PATH` so you can run `modman` from any directory. Add this line to `~/.bashrc`:
+The `bin`, `tools`, and `data` folders have to stay next to each other. Another location works too; change the paths above to match.
+
+### 3. Make the folder for the servers
+
+Every modpack lives in its own folder under `/srv/minecraft`, owned by the account that runs modman:
 
 ```bash
-export PATH="$HOME/.local/share/modman/bin:$PATH"
+sudo mkdir -p /srv/minecraft
+sudo chown "$USER": /srv/minecraft
 ```
 
-Open a new terminal, or run `source ~/.bashrc`, so the change takes effect.
+### 4. Add a CurseForge API key (optional)
 
-## Configuration
+Create a key at [console.curseforge.com](https://console.curseforge.com), then save it on one line:
 
-Each modpack is a folder under `/srv/minecraft`. The folder name is the name you type in modman.
+```bash
+nano ~/.local/share/modman/data/curseforge-api-key
+chmod 600 ~/.local/share/modman/data/curseforge-api-key
+```
+
+Skip this step if you only use packs you copy into `/srv/minecraft` yourself.
+
+### 5. Install and start a first server
+
+Start modman:
+
+```bash
+modman
+```
+
+At the `modman>` prompt, run `install`, search for a modpack, and pick a number from the list. The pack goes into `/srv/minecraft/<PackName>`, with spaces removed from the name.
+
+Minecraft will not start until you accept its [EULA](https://aka.ms/MinecraftEULA). Leave modman with `exit`, then run this, using the folder name `install` printed:
+
+```bash
+echo "eula=true" > /srv/minecraft/MyPack/eula.txt
+```
+
+Back in `modman`:
+
+```text
+enable MyPack
+start MyPack
+status
+```
+
+`status` shows **starting** while the server loads, then **running**. `join MyPack` opens its console; press **Ctrl-A**, then **d**, to leave it running.
+
+Players connect on port 25565 unless you change it with `port MyPack 25570`. Each server needs its own port. If the computer has a firewall, open that port, for example `sudo ufw allow 25565/tcp`.
+
+### 6. Start servers at boot (optional)
+
+At the `modman>` prompt:
+
+```text
+service install
+service enable
+```
+
+Every server you have run `enable` on starts after a reboot. The install step asks for your sudo password.
+
+### 7. Turn on the control page (optional)
+
+The page needs the user service manager running even when nobody is logged in:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+At the `modman>` prompt:
+
+```text
+web install
+web enable
+web start
+```
+
+`web install` asks for the page password. `web start` prints the links to open and the fingerprint of the page's certificate. To reach the page from outside your network, see [Open the page from the internet](#open-the-page-from-the-internet).
+
+## How modman finds servers
+
+Each modpack is a folder under `/srv/minecraft`. The folder name is the name you type in modman. To add a pack you set up by hand, copy its server files into a new folder there.
 
 `start.sh` has to be in that folder, and it has to be executable. modman runs `./start.sh` from the folder, inside a screen session. That script launches the Minecraft server. The mods, the server jar, and `eula.txt` stay in the pack for `start.sh` to use.
 
@@ -34,20 +144,14 @@ When `start.sh` does not name a `java` program, modman reads `JAVA=` from `varia
 
 The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting**, **running**, and **error** apart.
 
-`data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. The file stays on the computer where modman runs.
+`data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. `enable` and `disable` edit this file for you.
 
 ```text
 MyPack
 AnotherPack
 ```
 
-## Start it
-
-Open a terminal and run:
-
-```bash
-modman
-```
+## Using the prompt
 
 You get a `modman>` prompt. Type a command and press Enter. Type `help` to see the command list again, or `exit` to leave.
 
@@ -112,11 +216,13 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 ## The control page
 
-`web start` starts the page with the saved password. https is on port 8787. http is on port 8788. The page lists every modpack. Enabled servers have start, stop, and restart. A server that is only installed does not, so a one-off test of that server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running. Every server has enable or disable, the port, update, and uninstall. The console list has Actions plus each running server, and a server console keeps updating. Actions shows button results, such as stopping a modpack. The command box sends one line to the selected server.
+`web start` starts the page with the saved password. https is on port 8787. http on port 8788 only hands out the certificate, answers Let's Encrypt, and sends everything else to https. The page lists every modpack. Enabled servers have start, stop, and restart. A server that is only installed does not, so a one-off test of that server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running. Every server has enable or disable, the port, update, and uninstall. The console list has Actions plus each running server, and a server console keeps updating. Actions shows button results, such as stopping a modpack. The command box sends one line to the selected server.
 
-Update still asks whether to keep or delete the world. Choosing delete asks you to type yes. The browser sends a SHA-256 hash of the password, and modman keeps that hash.
+Update still asks whether to keep or delete the world. Choosing delete asks you to type yes.
 
-On the same network, open an address link that `web start` prints. The browser will ask you to trust a certificate from this computer. You can install that certificate from `http://<address>:8788/modman-ca.crt`.
+The password has to be at least 4 characters. modman keeps a salted scrypt hash of it, never the password. A password saved by an older modman still works, but `web start` warns until you run `web password` again. One address gets 10 wrong passwords every 15 minutes. Behind a tunnel every visitor shares the tunnel's address, so wrong guesses from anyone can lock the page for 15 minutes. A sign-in lasts 7 days, or 12 hours without use.
+
+On the same network, open an address link that `web start` prints. The browser will ask you to trust a certificate from this computer. You can install that certificate from `http://<address>:8788/modman-ca.crt`. `web start` prints its SHA-256 fingerprint; check that it matches before trusting it. The certificate can only vouch for local network addresses and names such as `.local` and `.lan`, so it cannot be used to fake other sites.
 
 From anywhere else, use a domain name. Put that name on one line in `data/.modman-web-domain`. The page gets a certificate for it from Let's Encrypt and renews it. See the next section for how the name has to reach this computer.
 
@@ -156,7 +262,7 @@ Use `web install` and `web enable` when the page should start again after a rebo
 
 ## Install a modpack
 
-Put a CurseForge API key on one line in `data/curseforge-api-key`. Create the key at [console.curseforge.com](https://console.curseforge.com). That file stays on the computer where modman runs.
+`install` and `update` need a CurseForge API key in `data/curseforge-api-key` (see [step 4](#4-add-a-curseforge-api-key-optional)). That file stays on the computer where modman runs.
 
 `install` asks for a modpack name, searches CurseForge, and lists the matches. Press Enter to leave the name prompt or the list. Type the number of the one you want. On the page, Clear beside Search drops the results.
 

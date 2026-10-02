@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Local control page for modman. Started by `web start`, not run on its own."""
 
+import base64
+import hashlib
 import hmac
 import json
 import os
@@ -38,18 +40,49 @@ if not PASSWORD_FILE or not os.path.isfile(PASSWORD_FILE):
     sys.stderr.write("Error: password file is missing.\n")
     sys.exit(1)
 with open(PASSWORD_FILE, encoding="utf-8") as fh:
-    PASSWORD_HEX = fh.read().strip().lower()
+    STORED_HASH = fh.read().strip().lower()
 os.remove(PASSWORD_FILE)
-if len(PASSWORD_HEX) != 64 or any(ch not in "0123456789abcdef" for ch in PASSWORD_HEX):
+
+# "scrypt$n$r$p$salt$digest", written by `web password`. A bare SHA-256 hex
+# digest is the older format; it still signs in until the password is set again.
+SCRYPT_RE = re.compile(r"scrypt\$(\d+)\$(\d+)\$(\d+)\$([0-9a-f]{32})\$([0-9a-f]{64})")
+scrypt_match = SCRYPT_RE.fullmatch(STORED_HASH)
+if scrypt_match:
+    SCRYPT_N, SCRYPT_R, SCRYPT_P = (int(x) for x in scrypt_match.group(1, 2, 3))
+    if not (2 ** 10 <= SCRYPT_N <= 2 ** 17 and SCRYPT_N & (SCRYPT_N - 1) == 0
+            and 1 <= SCRYPT_R <= 16 and 1 <= SCRYPT_P <= 4):
+        sys.stderr.write("Error: password hash is invalid.\n")
+        sys.exit(1)
+    PASSWORD_SALT = bytes.fromhex(scrypt_match.group(4))
+    PASSWORD_DIGEST = bytes.fromhex(scrypt_match.group(5))
+    PASSWORD_LEGACY = False
+elif re.fullmatch(r"[0-9a-f]{64}", STORED_HASH):
+    PASSWORD_DIGEST = bytes.fromhex(STORED_HASH)
+    PASSWORD_LEGACY = True
+    sys.stderr.write("Warning: the saved password uses the old hash. Run web password to replace it.\n")
+else:
     sys.stderr.write("Error: password hash is invalid.\n")
     sys.exit(1)
+del STORED_HASH
 if not BIN:
     sys.stderr.write("Error: MODMAN_BIN is not set.\n")
     sys.exit(1)
 
-sessions = set()
+SESSION_IDLE = 12 * 3600
+SESSION_MAX = 7 * 24 * 3600
+# token -> [created, last used]
+sessions = {}
 sessions_lock = threading.Lock()
 call_lock = threading.Lock()
+
+# One address gets LOGIN_IP_LIMIT wrong passwords per LOGIN_WINDOW. Every
+# address together gets LOGIN_GLOBAL_LIMIT per minute.
+LOGIN_WINDOW = 15 * 60
+LOGIN_IP_LIMIT = 10
+LOGIN_GLOBAL_LIMIT = 30
+login_failures = {}
+global_failures = []
+login_lock = threading.Lock()
 
 
 def read_domain():
@@ -105,10 +138,95 @@ def acme_challenge(token):
 
 
 def password_ok(given):
-    given = given.strip().lower()
-    if len(given) != len(PASSWORD_HEX):
+    if not given:
         return False
-    return hmac.compare_digest(PASSWORD_HEX, given)
+    if PASSWORD_LEGACY:
+        # The old prompt read the password with `read -r`, which drops outer blanks.
+        got = hashlib.sha256(given.strip(" \t").encode("utf-8")).digest()
+    else:
+        got = hashlib.scrypt(
+            given.encode("utf-8"),
+            salt=PASSWORD_SALT,
+            n=SCRYPT_N,
+            r=SCRYPT_R,
+            p=SCRYPT_P,
+            maxmem=2 * 128 * SCRYPT_R * SCRYPT_N * SCRYPT_P + (1 << 20),
+            dklen=len(PASSWORD_DIGEST),
+        )
+    return hmac.compare_digest(got, PASSWORD_DIGEST)
+
+
+def login_blocked(addr):
+    now = time.monotonic()
+    with login_lock:
+        global_failures[:] = [t for t in global_failures if now - t < 60]
+        if len(global_failures) >= LOGIN_GLOBAL_LIMIT:
+            return True
+        recent = [t for t in login_failures.get(addr, []) if now - t < LOGIN_WINDOW]
+        if recent:
+            login_failures[addr] = recent
+        else:
+            login_failures.pop(addr, None)
+        return len(recent) >= LOGIN_IP_LIMIT
+
+
+def login_failed(addr):
+    now = time.monotonic()
+    with login_lock:
+        global_failures.append(now)
+        login_failures.setdefault(addr, []).append(now)
+        if len(login_failures) > 1000:
+            for key in list(login_failures):
+                if now - login_failures[key][-1] >= LOGIN_WINDOW:
+                    del login_failures[key]
+
+
+def login_succeeded(addr):
+    with login_lock:
+        login_failures.pop(addr, None)
+
+
+def new_session():
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with sessions_lock:
+        for key, (created, used) in list(sessions.items()):
+            if now - created > SESSION_MAX or now - used > SESSION_IDLE:
+                del sessions[key]
+        sessions[token] = [now, now]
+    return token
+
+
+def session_ok(token):
+    if not token:
+        return False
+    now = time.monotonic()
+    with sessions_lock:
+        times = sessions.get(token)
+        if times is None:
+            return False
+        created, used = times
+        if now - created > SESSION_MAX or now - used > SESSION_IDLE:
+            del sessions[token]
+            return False
+        times[1] = now
+        return True
+
+
+def page_csp(html):
+    """Allow only the page's own inline scripts, by hash."""
+    hashes = []
+    for body in re.findall(r"<script>(.*?)</script>", html, re.S):
+        digest = base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode("ascii")
+        hashes.append(f"'sha256-{digest}'")
+    return (
+        "default-src 'self'; script-src " + " ".join(hashes)
+        + "; style-src 'unsafe-inline'; img-src 'self'; object-src 'none'"
+        + "; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    )
+
+
+HOST_RE = re.compile(r"([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::(\d{1,5}))?")
 
 
 def modman_call(args, timeout):
@@ -172,62 +290,17 @@ LOGIN_PAGE = """<!DOCTYPE html>
   </form>
 </main>
 <script>
-function sha256hex(text) {
-  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
-  const K = [
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-  ];
-  const msg = new TextEncoder().encode(text);
-  const total = ((msg.length + 9 + 63) >> 6) << 6;
-  const buf = new Uint8Array(total);
-  buf.set(msg);
-  buf[msg.length] = 0x80;
-  const view = new DataView(buf.buffer);
-  view.setUint32(total - 4, msg.length * 8, false);
-  let h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a;
-  let h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
-  const w = new Uint32Array(64);
-  for (let i = 0; i < buf.length; i += 64) {
-    for (let t = 0; t < 16; t++) w[t] = view.getUint32(i + t * 4, false);
-    for (let t = 16; t < 64; t++) {
-      const s0 = rotr(w[t-15], 7) ^ rotr(w[t-15], 18) ^ (w[t-15] >>> 3);
-      const s1 = rotr(w[t-2], 17) ^ rotr(w[t-2], 19) ^ (w[t-2] >>> 10);
-      w[t] = (w[t-16] + s0 + w[t-7] + s1) >>> 0;
-    }
-    let a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
-    for (let t = 0; t < 64; t++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-      const ch = (e & f) ^ (~e & g);
-      const t1 = (h + S1 + ch + K[t] + w[t]) >>> 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const t2 = (S0 + maj) >>> 0;
-      h=g; g=f; f=e; e=(d + t1) >>> 0; d=c; c=b; b=a; a=(t1 + t2) >>> 0;
-    }
-    h0=(h0+a)>>>0; h1=(h1+b)>>>0; h2=(h2+c)>>>0; h3=(h3+d)>>>0;
-    h4=(h4+e)>>>0; h5=(h5+f)>>>0; h6=(h6+g)>>>0; h7=(h7+h)>>>0;
-  }
-  return [h0,h1,h2,h3,h4,h5,h6,h7].map((x) => x.toString(16).padStart(8, "0")).join("");
-}
 document.getElementById("login").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const input = document.getElementById("password");
-  const hash = sha256hex(input.value);
+  const password = input.value;
   input.value = "";
   const res = await fetch("/login", {
     method: "POST",
     headers: {"Content-Type": "application/x-www-form-urlencoded"},
-    body: "password=" + encodeURIComponent(hash),
-    redirect: "manual"
+    body: "password=" + encodeURIComponent(password)
   });
-  location.href = res.headers.get("Location") || "/";
+  location.href = res.redirected ? res.url : "/login?error=1";
 });
 </script>
 </body>
@@ -941,6 +1014,13 @@ setInterval(refreshConsole, 2000);
 </html>
 """
 
+LOGIN_CSP = page_csp(LOGIN_PAGE)
+APP_CSP = page_csp(APP_PAGE)
+LOGIN_ERRORS = {
+    "1": "Wrong password.",
+    "2": "Too many wrong passwords. Try again later.",
+}
+
 
 class Handler(BaseHTTPRequestHandler):
     # Browsers drop an https page that answers HTTP/1.0.
@@ -950,6 +1030,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def setup(self):
+        # setup() sets the socket timeout first, so a client that never
+        # finishes the TLS handshake only holds its own thread.
+        super().setup()
+        self.tls_failed = False
+        if isinstance(self.connection, ssl.SSLSocket):
+            try:
+                self.connection.do_handshake()
+            except (ssl.SSLError, OSError):
+                self.tls_failed = True
+
+    def handle(self):
+        if self.tls_failed:
+            self.close_connection = True
+            return
+        super().handle()
+
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if getattr(self.server, "tls", False):
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        super().end_headers()
 
     def cookie_flags(self):
         flags = "HttpOnly; SameSite=Lax; Path=/"
@@ -966,16 +1071,15 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def authed(self):
-        token = self.cookie_token()
-        with sessions_lock:
-            return token in sessions
+        return session_ok(self.cookie_token())
 
-    def send_html(self, code, html):
+    def send_html(self, code, html, csp):
         data = html.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", csp)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1023,38 +1127,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/.well-known/acme-challenge/"):
-            body = acme_challenge(parsed.path[len("/.well-known/acme-challenge/"):])
+    def serve_public(self, path):
+        """Answer the paths that need no sign-in. False when path is not one of them."""
+        if path.startswith("/.well-known/acme-challenge/"):
+            body = acme_challenge(path[len("/.well-known/acme-challenge/"):])
             if body is None:
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                return
+                return True
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            return
-        if parsed.path == "/modman-ca.crt":
+            return True
+        if path == "/modman-ca.crt":
             self.send_ca()
-            return
-        if parsed.path == "/favicon.ico":
+            return True
+        if path == "/favicon.ico":
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return True
+        return False
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if self.serve_public(parsed.path):
             return
         if parsed.path == "/login":
-            error = "<p class=\"err\">Wrong password.</p>" if "error=1" in (parsed.query or "") else ""
-            self.send_html(200, LOGIN_PAGE.replace("__ERROR__", error))
+            query = parse_qs(parsed.query or "")
+            error = (query.get("error") or [""])[0]
+            message = LOGIN_ERRORS.get(error, "")
+            html = f"<p class=\"err\">{message}</p>" if message else ""
+            self.send_html(200, LOGIN_PAGE.replace("__ERROR__", html), LOGIN_CSP)
             return
         if parsed.path == "/":
             if not self.authed():
                 self.redirect("/login")
                 return
-            self.send_html(200, APP_PAGE)
+            self.send_html(200, APP_PAGE, APP_CSP)
             return
         if not self.authed():
             self.send_json(401, {"ok": False, "output": "Sign in required."})
@@ -1078,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/logout":
             token = self.cookie_token()
             with sessions_lock:
-                sessions.discard(token)
+                sessions.pop(token, None)
             self.redirect(
                 "/login",
                 f"modman_session=; {self.cookie_flags()}; Max-Age=0",
@@ -1117,15 +1230,20 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect("/login?error=1")
             return
         raw = self.rfile.read(length) if length else b""
+        addr = self.client_address[0]
+        if login_blocked(addr):
+            time.sleep(1)
+            self.redirect("/login?error=2")
+            return
         fields = parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
         given = (fields.get("password") or [""])[0]
         if not password_ok(given):
+            login_failed(addr)
             time.sleep(1)
             self.redirect("/login?error=1")
             return
-        token = secrets.token_urlsafe(32)
-        with sessions_lock:
-            sessions.add(token)
+        login_succeeded(addr)
+        token = new_session()
         self.redirect(
             "/",
             f"modman_session={token}; {self.cookie_flags()}",
@@ -1242,6 +1360,39 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
+class HTTPHandler(Handler):
+    """The plain http port. It answers the Let's Encrypt check and the CA
+    download, and sends everything else to https."""
+
+    def do_GET(self):
+        if self.serve_public(urlparse(self.path).path):
+            return
+        self.redirect_https(301)
+
+    def do_POST(self):
+        self.redirect_https(308)
+
+    def redirect_https(self, code):
+        match = HOST_RE.fullmatch(self.headers.get("Host", ""))
+        if not match:
+            self.close_connection = True
+            self.send_json(400, {"ok": False, "output": "Open this page with https."})
+            return
+        host, port = match.group(1), match.group(2)
+        # A port in the Host header means the browser reached this port
+        # directly. No port means public port 80 forwarded here, so https is
+        # on public port 443.
+        target = f"https://{host}:{PORT}" if port else f"https://{host}"
+        path = self.path if self.path.startswith("/") else "/"
+        # A POST body is left unread, so the connection cannot be reused.
+        self.close_connection = True
+        self.send_response(code)
+        self.send_header("Location", target + path)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+
 class HTTPSServer(ThreadingHTTPServer):
     tls = True
 
@@ -1252,7 +1403,10 @@ class HTTPSServer(ThreadingHTTPServer):
     def get_request(self):
         sock, addr = super().get_request()
         try:
-            return self.tls_context.wrap_socket(sock, server_side=True), addr
+            # The handshake runs in the request thread. See Handler.setup.
+            return self.tls_context.wrap_socket(
+                sock, server_side=True, do_handshake_on_connect=False
+            ), addr
         except OSError:
             sock.close()
             raise
@@ -1278,7 +1432,7 @@ def main():
     if domain:
         use_signed_certificate(domain)
     https = HTTPSServer((BIND, PORT), Handler, context)
-    http = ThreadingHTTPServer((BIND, HTTP_PORT), Handler)
+    http = ThreadingHTTPServer((BIND, HTTP_PORT), HTTPHandler)
     http.tls = False
     threading.Thread(target=http.serve_forever, daemon=True).start()
     if domain:

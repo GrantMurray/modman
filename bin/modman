@@ -1328,13 +1328,22 @@ read_curseforge_key() {
 	printf '%s' "$key"
 }
 
+# curl config that adds the CurseForge key header. Read with curl -K -.
+curl_key_config() {
+	local key="$1"
+	key="${key//\\/\\\\}"
+	key="${key//\"/\\\"}"
+	printf 'header = "x-api-key: %s"\n' "$key"
+}
+
 # Print the response body. On failure, print the HTTP status and return 1.
 cf_api_get() {
 	local key="$1"
 	local url="$2"
 	local body http
 	body="$(mktemp)"
-	if ! http="$(curl -sS --retry 2 -A modman -H "Accept: application/json" -H "x-api-key: ${key}" -o "$body" -w "%{http_code}" "$url")"; then
+	# The key goes in through stdin so it does not show in the process list.
+	if ! http="$(curl_key_config "$key" | curl -sS --retry 2 -A modman -H "Accept: application/json" -K - -o "$body" -w "%{http_code}" "$url")"; then
 		rm -f "$body"
 		if ((CF_CANCELLED)); then
 			return 3
@@ -1810,7 +1819,8 @@ cf_stage_server_pack() {
 	url="$(cf_download_url "$key" "$mod_id" "$file_id")" || return 1
 	work="$(mktemp -d)"
 	zip="${work}/pack.zip"
-	if ! curl -fL --retry 2 -A modman -H "x-api-key: ${key}" -o "$zip" -# "$url"; then
+	# The download host is CurseForge's file CDN, which does not need the key.
+	if ! curl -fL --proto =https --retry 2 -A modman -o "$zip" -# "$url"; then
 		rm -rf "$work"
 		echo "Error: download failed." >&2
 		return 1
@@ -2633,53 +2643,100 @@ web_is_running() {
 web_print_links() {
 	local https_port="$1"
 	local http_port="${2:-$WEB_HTTP_PORT}"
-	local ip found=0 domain=""
+	local ip domain="" lan_ip=""
+	local -a ips=()
 	if [[ -s "$WEB_DOMAIN_FILE" ]]; then
 		domain="$(head -n 1 "$WEB_DOMAIN_FILE" | tr -d '[:space:]')"
 	fi
 	if [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$domain" == *.* ]]; then
 		echo "https://${domain}/"
 	fi
-	while IFS= read -r ip; do
-		[[ -n "$ip" ]] || continue
+	mapfile -t ips < <(web_private_ips)
+	for ip in "${ips[@]+"${ips[@]}"}"; do
 		[[ "$ip" == 127.* ]] && continue
-		[[ "$ip" == *:* ]] && continue
 		echo "https://${ip}:${https_port}/"
-		found=1
-	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
-	if ((found == 0)); then
+		[[ -n "$lan_ip" ]] || lan_ip="$ip"
+	done
+	if [[ -z "$lan_ip" ]]; then
 		echo "https://127.0.0.1:${https_port}/"
 	else
 		echo "On this machine: https://127.0.0.1:${https_port}/"
 	fi
-	echo "HTTP fallback:"
-	found=0
-	while IFS= read -r ip; do
-		[[ -n "$ip" ]] || continue
-		[[ "$ip" == 127.* ]] && continue
-		[[ "$ip" == *:* ]] && continue
-		echo "http://${ip}:${http_port}/"
-		found=1
-	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
-	if ((found == 0)); then
-		echo "http://127.0.0.1:${http_port}/"
-	else
-		echo "On this machine: http://127.0.0.1:${http_port}/"
+	echo "Certificate for other devices: http://${lan_ip:-127.0.0.1}:${http_port}/modman-ca.crt"
+	if [[ -s "$WEB_CA_FILE" ]]; then
+		echo "Check that its fingerprint matches before trusting it:"
+		openssl x509 -in "$WEB_CA_FILE" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=/  /' || true
 	fi
+}
+
+# The local CA may only sign for these networks and names, so its key cannot
+# be used to impersonate other sites. Public addresses use the domain instead.
+WEB_CA_IP_RANGES=(
+	127.0.0.0/255.0.0.0
+	10.0.0.0/255.0.0.0
+	172.16.0.0/255.240.0.0
+	192.168.0.0/255.255.0.0
+	100.64.0.0/255.192.0.0
+)
+WEB_CA_DNS_SUFFIXES=(localhost local lan home.arpa internal)
+
+# IPv4 addresses of this computer inside WEB_CA_IP_RANGES, other than 127.x.
+web_private_ips() {
+	local ip a b
+	while IFS= read -r ip; do
+		[[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+\.[0-9]+$ ]] || continue
+		a="${BASH_REMATCH[1]}"
+		b="${BASH_REMATCH[2]}"
+		if ((a == 10)) || ((a == 172 && b >= 16 && b <= 31)) \
+			|| ((a == 192 && b == 168)) || ((a == 100 && b >= 64 && b <= 127)); then
+			printf '%s\n' "$ip"
+		fi
+	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+}
+
+# Host name when it falls under WEB_CA_DNS_SUFFIXES, or a single label.
+web_local_hostname() {
+	local name suffix
+	name="$(hostname -f 2>/dev/null || true)"
+	name="${name,,}"
+	[[ "$name" =~ ^[a-z0-9.-]+$ && "$name" != "localhost" ]] || return 0
+	if [[ "$name" != *.* ]]; then
+		printf '%s' "$name"
+		return 0
+	fi
+	for suffix in "${WEB_CA_DNS_SUFFIXES[@]}"; do
+		if [[ "$name" == *".${suffix}" ]]; then
+			printf '%s' "$name"
+			return 0
+		fi
+	done
 }
 
 web_cert_names() {
 	local san="DNS:localhost,IP:127.0.0.1" ip name
 	while IFS= read -r ip; do
-		[[ -n "$ip" ]] || continue
-		[[ "$ip" == *:* ]] && continue
 		san+=",IP:${ip}"
-	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
-	name="$(hostname -f 2>/dev/null || true)"
-	if [[ "$name" =~ ^[A-Za-z0-9.-]+$ && "$name" != "localhost" ]]; then
+	done < <(web_private_ips)
+	name="$(web_local_hostname)"
+	if [[ -n "$name" ]]; then
 		san+=",DNS:${name}"
 	fi
 	printf '%s' "$san"
+}
+
+web_ca_constraints() {
+	local out="critical" range suffix name
+	for range in "${WEB_CA_IP_RANGES[@]}"; do
+		out+=",permitted;IP:${range}"
+	done
+	for suffix in "${WEB_CA_DNS_SUFFIXES[@]}"; do
+		out+=",permitted;DNS:${suffix}"
+	done
+	name="$(web_local_hostname)"
+	if [[ -n "$name" && "$name" != *.* ]]; then
+		out+=",permitted;DNS:${name}"
+	fi
+	printf '%s' "$out"
 }
 
 web_cert_ok() {
@@ -2691,11 +2748,8 @@ web_cert_ok() {
 	[[ "$text" == *'TLS Web Server Authentication'* ]] || return 1
 	[[ "$text" == *'IP Address:127.0.0.1'* ]] || return 1
 	while IFS= read -r ip; do
-		[[ -n "$ip" ]] || continue
-		[[ "$ip" == *:* ]] && continue
-		[[ "$ip" == 127.* ]] && continue
 		[[ "$text" == *"IP Address:${ip}"* ]] || return 1
-	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+	done < <(web_private_ips)
 	return 0
 }
 
@@ -2703,7 +2757,13 @@ web_ensure_ca() {
 	local text not_before not_after
 	if [[ -s "$WEB_CA_FILE" && -s "$WEB_CA_KEY_FILE" ]]; then
 		text="$(openssl x509 -in "$WEB_CA_FILE" -noout -text 2>/dev/null || true)"
-		[[ "$text" == *'CA:TRUE'* ]] && return 0
+		# A CA made before name constraints is replaced, and so is its server cert.
+		if [[ "$text" == *'CA:TRUE'* && "$text" == *'Name Constraints'* ]]; then
+			return 0
+		fi
+		echo "Replacing the local https certificate with one limited to this network."
+		echo "Devices that trusted the old modman certificate need to remove it and install the new one."
+		rm -f "$WEB_CERT_FILE" "$WEB_KEY_FILE"
 	fi
 	not_before="$(date -u -d '2 days ago' +%Y%m%d%H%M%SZ)"
 	not_after="$(date -u -d '10 years' +%Y%m%d%H%M%SZ)"
@@ -2713,7 +2773,8 @@ web_ensure_ca() {
 		-not_before "$not_before" -not_after "$not_after" \
 		-subj /CN=modman \
 		-addext basicConstraints=critical,CA:TRUE \
-		-addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1; then
+		-addext keyUsage=critical,keyCertSign,cRLSign \
+		-addext "nameConstraints=$(web_ca_constraints)" >/dev/null 2>&1; then
 		rm -f "$WEB_CA_FILE" "$WEB_CA_KEY_FILE"
 		echo "Error: could not create the https certificate." >&2
 		return 1
@@ -2839,25 +2900,47 @@ web_save_hash() {
 	umask "$old_umask"
 }
 
+# "scrypt$n$r$p$salt$digest". A bare 64-digit SHA-256 hash is the old format.
+WEB_HASH_RE='^scrypt\$[0-9]+\$[0-9]+\$[0-9]+\$[0-9a-f]{32}\$[0-9a-f]{64}$'
+WEB_LEGACY_HASH_RE='^[0-9a-f]{64}$'
+WEB_PASSWORD_MIN=4
+
 # Prompt for the webpage password and store its hash in WEB_PASSWORD_HASH.
 web_prompt_hash() {
-	local password
-	if ! read -r -s -p "Password for the webpage: " password; then
+	local password again
+	if ! IFS= read -r -s -p "Password for the webpage (at least ${WEB_PASSWORD_MIN} characters): " password; then
 		echo
 		return 1
 	fi
 	echo
-	if [[ -z "$password" ]]; then
-		echo "Error: password cannot be empty." >&2
+	if ((${#password} < WEB_PASSWORD_MIN)); then
+		unset password
+		echo "Error: the password must be at least ${WEB_PASSWORD_MIN} characters." >&2
 		return 1
 	fi
-	if ! WEB_PASSWORD_HASH="$(printf '%s' "$password" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; then
+	if ! IFS= read -r -s -p "Type it again: " again; then
+		unset password
+		echo
+		return 1
+	fi
+	echo
+	if [[ "$password" != "$again" ]]; then
+		unset password again
+		echo "Error: the passwords do not match." >&2
+		return 1
+	fi
+	unset again
+	if ! WEB_PASSWORD_HASH="$(printf '%s' "$password" | python3 -c 'import hashlib, os, sys
+n, r, p = 2 ** 14, 8, 1
+salt = os.urandom(16)
+digest = hashlib.scrypt(sys.stdin.buffer.read(), salt=salt, n=n, r=r, p=p, dklen=32)
+sys.stdout.write(f"scrypt${n}${r}${p}${salt.hex()}${digest.hex()}")')"; then
 		unset password WEB_PASSWORD_HASH
 		echo "Error: could not hash the password." >&2
 		return 1
 	fi
 	unset password
-	if [[ ! "$WEB_PASSWORD_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+	if [[ ! "$WEB_PASSWORD_HASH" =~ $WEB_HASH_RE ]]; then
 		unset WEB_PASSWORD_HASH
 		echo "Error: could not hash the password." >&2
 		return 1
@@ -2872,7 +2955,9 @@ web_require_hash() {
 		return 1
 	fi
 	hash="$(tr -d '[:space:]' <"$WEB_HASH_FILE")"
-	if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+	if [[ "$hash" =~ $WEB_LEGACY_HASH_RE ]]; then
+		echo "Warning: the saved webpage password uses an old, weak hash. Run web password to replace it." >&2
+	elif [[ ! "$hash" =~ $WEB_HASH_RE ]]; then
 		echo "Error: the saved webpage password is invalid. Run web password." >&2
 		return 1
 	fi
