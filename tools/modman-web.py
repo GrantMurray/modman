@@ -121,6 +121,18 @@ def modman_call(args, timeout):
         )
 
 
+def parse_log_frame(stdout):
+    header, sep, body = stdout.partition("\n")
+    if not sep:
+        return None
+    parts = header.split()
+    if len(parts) != 3 or parts[0] != "MODMAN_LOG" or parts[1] not in ("0", "1"):
+        return None
+    if not parts[2].isdigit():
+        return None
+    return parts[1] == "1", int(parts[2]), body
+
+
 def command_text(proc):
     parts = []
     if proc.stdout:
@@ -253,7 +265,16 @@ APP_PAGE = r"""<!DOCTYPE html>
   .actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
   .actions input[type="number"] { width: 5.5rem; font: inherit; padding: 0.2rem; }
   .danger { color: #8d1d1d; border-color: #e0b4b4; }
-  #out { white-space: pre-wrap; background: #1c1c1c; color: #f3f0e8; padding: 0.8rem; min-height: 2.5rem; }
+  .console-head { display: flex; align-items: center; gap: 0.45rem; margin: 1.2rem 0 0.4rem; }
+  .console-head h2 { margin: 0; }
+  .spinner { width: 0.9rem; height: 0.9rem; border: 2px solid #c8c2b4; border-top-color: #1f3d2d; border-radius: 50%; animation: spin 0.7s linear infinite; }
+  .spinner[hidden] { display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .console-form { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.4rem 0; }
+  .console-form[hidden] { display: none; }
+  .console-form select, .console-form input { font: inherit; padding: 0.3rem; }
+  .console-form input { flex: 1; min-width: 12rem; }
+  #out { white-space: pre-wrap; background: #1c1c1c; color: #f3f0e8; padding: 0.8rem; min-height: 2.5rem; max-height: 24rem; overflow: auto; }
   dialog { border: 1px solid #ccc; padding: 1rem; max-width: 28rem; }
   dialog label { display: block; margin: 0.5rem 0; }
   dialog [hidden] { display: none; }
@@ -298,7 +319,16 @@ APP_PAGE = r"""<!DOCTYPE html>
     <ul id="search-results" class="results"></ul>
   </section>
   <div id="packs"></div>
-  <h2>Console</h2>
+  <div class="console-head">
+    <h2>Console</h2>
+    <span id="console-spin" class="spinner" hidden role="status" aria-label="Loading"></span>
+  </div>
+  <form id="console-form" class="console-form">
+    <select id="console-pack" aria-label="Modpack"></select>
+    <input id="console-cmd" type="text" maxlength="300" placeholder="Command" autocomplete="off">
+    <button type="submit">Send</button>
+  </form>
+  <p id="console-msg" class="muted"></p>
   <pre id="out">Loading…</pre>
 </main>
 <dialog id="dlg"></dialog>
@@ -308,6 +338,10 @@ const dlg = document.getElementById("dlg");
 let hold = false;
 let packs = [];
 let searchAbort = null;
+let consoleName = "";
+let consoleOffset = 0;
+let consoleBusy = false;
+let consoleTicket = 0;
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -408,7 +442,6 @@ function row(pack) {
       <button type="button" data-act="stop">Stop</button>
       <button type="button" data-act="restart">Restart</button>
       ${indexBtn}
-      <button type="button" data-act="log">Log</button>
       <button type="button" data-act="update">Update</button>
       <button type="button" class="danger" data-act="uninstall">Uninstall</button>
     </td>
@@ -437,6 +470,123 @@ function render() {
     table("Active", indexed) + table("Installed", other);
 }
 
+function runningPacks() {
+  return packs.filter((p) => p.status === "running");
+}
+
+function setConsoleBusy(on) {
+  consoleBusy = on;
+  document.getElementById("console-spin").hidden = !on;
+  for (const el of document.querySelectorAll("#console-form select, #console-form input, #console-form button")) {
+    el.disabled = on;
+  }
+}
+
+function fillConsolePacks() {
+  if (consoleBusy) return;
+  const sel = document.getElementById("console-pack");
+  if (document.activeElement === sel) return;
+  const names = runningPacks().map((p) => p.name);
+  const same = names.length === sel.options.length && names.every((name, i) => sel.options[i].value === name);
+  const previous = sel.value;
+  if (!same) {
+    sel.innerHTML = names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+  }
+  const keep = names.includes(consoleName) ? consoleName : (names.includes(previous) ? previous : (names[0] || ""));
+  if (keep) sel.value = keep;
+  if (consoleName && !names.includes(consoleName)) {
+    consoleName = "";
+    consoleOffset = 0;
+  }
+  if (!consoleName && sel.value && names.includes(sel.value)) consoleName = sel.value;
+}
+
+function trimConsole(text) {
+  const lines = text.split("\n");
+  const keep = text.endsWith("\n") ? 201 : 200;
+  if (lines.length <= keep) return text;
+  return lines.slice(lines.length - keep).join("\n");
+}
+
+function showConsole(text, replace) {
+  const next = trimConsole(replace ? text : out.textContent + text);
+  if (next === out.textContent) return;
+  const nearBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 48;
+  out.textContent = next;
+  if (nearBottom || replace) out.scrollTop = out.scrollHeight;
+}
+
+async function refreshConsole(force) {
+  if (!consoleName || hold || dlg.open) return;
+  if (consoleBusy && !force) return;
+  const ticket = ++consoleTicket;
+  const name = consoleName;
+  const offset = consoleOffset;
+  const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=" + offset);
+  if (ticket !== consoleTicket || !data || hold || name !== consoleName) return;
+  if (data.ok === false) {
+    document.getElementById("console-msg").textContent = data.output || "Failed.";
+    return;
+  }
+  if (Number.isFinite(data.offset) && data.offset >= 0) consoleOffset = data.offset;
+  const chunk = data.output || "";
+  const replace = !!data.reset || offset === 0;
+  if (!replace && !chunk) return;
+  showConsole(chunk, replace);
+}
+
+async function followConsole(name) {
+  if (consoleBusy) return;
+  if (!runningPacks().some((p) => p.name === name)) {
+    document.getElementById("console-msg").textContent = "That server is not running.";
+    return;
+  }
+  if (name !== consoleName) consoleOffset = 0;
+  consoleName = name;
+  const sel = document.getElementById("console-pack");
+  if ([...sel.options].some((opt) => opt.value === name)) sel.value = name;
+  document.getElementById("console-msg").textContent = "";
+  setConsoleBusy(true);
+  try {
+    await refreshConsole(true);
+  } catch {
+    document.getElementById("console-msg").textContent = "The page could not reach the server.";
+  } finally {
+    setConsoleBusy(false);
+  }
+}
+
+document.getElementById("console-pack").onchange = () => {
+  if (consoleBusy) return;
+  followConsole(document.getElementById("console-pack").value);
+};
+
+document.getElementById("console-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (consoleBusy) return;
+  const name = document.getElementById("console-pack").value;
+  const input = document.getElementById("console-cmd");
+  const command = input.value;
+  const msg = document.getElementById("console-msg");
+  if (!name || !command.trim()) return;
+  if (name !== consoleName) consoleOffset = 0;
+  consoleName = name;
+  msg.textContent = "";
+  setConsoleBusy(true);
+  try {
+    const data = await api("/api/command", {name, command});
+    if (!data) return;
+    if (!data.ok) msg.textContent = data.output || "Failed.";
+    else input.value = "";
+    await refreshConsole(true);
+  } catch {
+    msg.textContent = "The page could not reach the server.";
+  } finally {
+    setConsoleBusy(false);
+  }
+  setTimeout(refreshConsole, 500);
+};
+
 async function loadPacks() {
   if (hold || dlg.open) return;
   const data = await api("/api/packs");
@@ -445,12 +595,17 @@ async function loadPacks() {
     return;
   }
   packs = data.packs;
+  fillConsolePacks();
   const svc = data.service || {};
   paintDot("svc-dot", svc.active === "active", svc.active);
   paintDot("boot-dot", svc.enabled === "enabled", svc.enabled);
-  if (document.activeElement && document.activeElement.matches("input")) return;
+  if (document.activeElement && document.activeElement.matches("input")) {
+    refreshConsole();
+    return;
+  }
   render();
-  if (out.textContent === "Loading…") show("");
+  if (out.textContent === "Loading…" && !consoleName) show("");
+  refreshConsole();
 }
 
 document.getElementById("packs").onclick = async (ev) => {
@@ -463,15 +618,6 @@ document.getElementById("packs").onclick = async (ev) => {
   if (act === "port") {
     const port = tr.querySelector("[data-port]").value;
     run({cmd: "port", name, port}, `Setting ${name} port to ${port}…`);
-    return;
-  }
-  if (act === "log") {
-    hold = true;
-    show(`Reading ${name} log…`);
-    try {
-      const data = await api("/api/log?name=" + encodeURIComponent(name));
-      if (data) show(data.output || "");
-    } finally { hold = false; }
     return;
   }
   if (act === "uninstall") {
@@ -606,6 +752,7 @@ document.getElementById("search-form").onsubmit = async (ev) => {
 
 loadPacks();
 setInterval(loadPacks, 5000);
+setInterval(refreshConsole, 2000);
 </script>
 </body>
 </html>
@@ -735,7 +882,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/log":
             query = parse_qs(parsed.query or "")
             name = (query.get("name") or [""])[0]
-            self.handle_log(name)
+            offset = (query.get("offset") or ["0"])[0]
+            self.handle_log(name, offset)
             return
         self.send_json(404, {"ok": False, "output": "Not found."})
 
@@ -775,6 +923,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/update":
             self.handle_update(body)
             return
+        if parsed.path == "/api/command":
+            self.handle_command(body)
+            return
         self.send_json(404, {"ok": False, "output": "Not found."})
 
     def handle_login(self):
@@ -813,15 +964,39 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, data)
 
-    def handle_log(self, name):
+    def handle_command(self, body):
+        self.finish_call([
+            "command",
+            str(body.get("name") or ""),
+            str(body.get("command") or ""),
+        ], 30)
+
+    def handle_log(self, name, offset):
+        if not str(offset).isdigit() or len(str(offset)) > 18:
+            offset = "0"
         try:
-            proc = modman_call(["log", name], 30)
+            proc = modman_call(["log", name, str(offset)], 30)
         except subprocess.TimeoutExpired:
             self.send_json(504, {"ok": False, "output": "Timed out reading the log."})
             return
-        self.send_json(200 if proc.returncode == 0 else 400, {
-            "ok": proc.returncode == 0,
-            "output": command_text(proc),
+        if proc.returncode != 0:
+            self.send_json(400, {
+                "ok": False,
+                "output": command_text(proc),
+                "offset": 0,
+                "reset": True,
+            })
+            return
+        parsed = parse_log_frame(proc.stdout or "")
+        if parsed is None:
+            self.send_json(500, {"ok": False, "output": "Could not read the log.", "offset": 0, "reset": True})
+            return
+        reset, new_offset, body = parsed
+        self.send_json(200, {
+            "ok": True,
+            "output": body,
+            "offset": new_offset,
+            "reset": reset,
         })
 
     def handle_run(self, body):

@@ -2290,20 +2290,91 @@ PY
 	return "$status"
 }
 
+# First line is "MODMAN_LOG <reset 0|1> <next offset>". The rest is log text.
+# offset 0, or an offset past the end of the file, sends the last 200 lines.
+# Any other offset sends only the bytes written after that point.
 web_show_log() {
 	local name="${1:-}"
-	local log
+	local offset="${2:-0}"
+	local log size
 	require_modpack "$name" || return 1
 	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 		return 1
 	fi
+	if [[ ! "$offset" =~ ^[0-9]{1,18}$ ]]; then
+		offset=0
+	fi
 	log="$MINECRAFT_ROOT/$name/logs/latest.log"
 	if [[ ! -f "$log" ]]; then
-		echo "No log yet."
+		printf 'MODMAN_LOG 1 0\nNo log yet.\n'
 		return 0
 	fi
-	tail -n 200 "$log"
+	size="$(stat -c '%s' "$log")"
+	if (( offset == 0 || offset > size )); then
+		printf 'MODMAN_LOG 1 %s\n' "$size"
+		head -c "$size" "$log" | tail -n 200
+		return 0
+	fi
+	printf 'MODMAN_LOG 0 %s\n' "$size"
+	if (( offset < size )); then
+		tail -c +$((offset + 1)) "$log" | head -c $((size - offset))
+	fi
+}
+
+# screen's stuff command treats ^ and \ as escapes. Quote those so a
+# console line is typed through as itself.
+screen_stuff_escape() {
+	printf '%s' "$1" | python3 -c 'import sys
+out = []
+for ch in sys.stdin.read():
+    if ch == "\\":
+        out.append("\\\\")
+    elif ch == "^":
+        out.append("\\136")
+    else:
+        out.append(ch)
+sys.stdout.write("".join(out))'
+}
+
+web_send_command() {
+	local name="${1:-}"
+	local command="${2:-}"
+	local session escaped
+	require_modpack "$name" || return 1
+	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	command="${command#"${command%%[![:space:]]*}"}"
+	command="${command%"${command##*[![:space:]]}"}"
+	if [[ "$command" == /* ]]; then
+		command="${command#/}"
+	fi
+	if [[ -z "$command" ]]; then
+		echo "Error: enter a command." >&2
+		return 1
+	fi
+	if ((${#command} > 300)); then
+		echo "Error: command is too long." >&2
+		return 1
+	fi
+	if [[ "$command" == *$'\n'* || "$command" == *$'\r'* || "$command" =~ [[:cntrl:]] ]]; then
+		echo "Error: command must be one line." >&2
+		return 1
+	fi
+	if ! is_running "$name"; then
+		echo "Error: '$name' is not running." >&2
+		return 1
+	fi
+	escaped="$(screen_stuff_escape "$command")"
+	session="$(screen_name "$name")"
+	# ^M is screen's carriage return, which submits the line.
+	if ! screen -S "$session" -p 0 -X stuff "${escaped}^M"; then
+		echo "Error: could not send the command." >&2
+		return 1
+	fi
+	echo "Sent to $name."
 }
 
 web_search() {
@@ -2451,7 +2522,8 @@ web_call() {
 	shift || true
 	case "$op" in
 	packs) web_json_packs ;;
-	log) web_show_log "${1:-}" ;;
+	log) web_show_log "${1:-}" "${2:-}" ;;
+	command) web_send_command "${1:-}" "${2:-}" ;;
 	search) web_search "${1:-}" ;;
 	install) web_install_modpack "${1:-}" ;;
 	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
@@ -2526,20 +2598,6 @@ web_print_links() {
 		echo "http://127.0.0.1:${http_port}/"
 	else
 		echo "On this machine: http://127.0.0.1:${http_port}/"
-	fi
-	echo "Certificate:"
-	found=0
-	while IFS= read -r ip; do
-		[[ -n "$ip" ]] || continue
-		[[ "$ip" == 127.* ]] && continue
-		[[ "$ip" == *:* ]] && continue
-		echo "http://${ip}:${http_port}/modman-ca.crt"
-		found=1
-	done < <(hostname -I 2>/dev/null | tr ' ' '\n')
-	if ((found == 0)); then
-		echo "http://127.0.0.1:${http_port}/modman-ca.crt"
-	else
-		echo "On this machine: http://127.0.0.1:${http_port}/modman-ca.crt"
 	fi
 }
 
@@ -2647,17 +2705,14 @@ web_trust_ca() {
 	local dest="/usr/local/share/ca-certificates/modman-web.crt"
 	if [[ -r /etc/ssl/certs/ca-certificates.crt ]] \
 		&& openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$WEB_CERT_FILE" >/dev/null 2>&1; then
-		echo "This computer trusts the https certificate."
 		return 0
 	fi
 	echo "Trusting the https certificate on this computer."
 	if command -v sudo >/dev/null 2>&1 \
 		&& sudo bash -c 'cp "$1" "$2" && update-ca-certificates' bash "$WEB_CA_FILE" "$dest" >/dev/null; then
-		echo "This computer trusts the https certificate."
 		return 0
 	fi
 	echo "This computer did not trust the certificate."
-	echo "Install it from a certificate link below, then open an https link."
 	echo "If the browser shows a certificate error and no way to continue, click the page and type thisisunsafe."
 }
 
@@ -2780,7 +2835,6 @@ web_start() {
 	fi
 	web_ensure_cert || return 1
 	web_trust_ca || true
-	echo "http on port ${WEB_HTTP_PORT} works before a browser will open https."
 	web_require_hash || return 1
 	if [[ -f "$WEB_SYSTEMD_UNIT" ]]; then
 		unset WEB_PASSWORD_HASH

@@ -109,7 +109,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 ## The control page
 
-`web start` starts the page with the saved password. https is on port 8787. http is on port 8788. The page lists every modpack and has buttons for start, stop, restart, enable, disable, the port, the log, install, update, and uninstall.
+`web start` starts the page with the saved password. https is on port 8787. http is on port 8788. The page lists every modpack and has buttons for start, stop, restart, enable, disable, the port, install, update, and uninstall. The console list only includes running servers, and that console keeps updating. The command box sends one line to the selected server.
 
 Update still asks whether to keep or delete the world. Choosing delete asks you to type yes. The browser sends a SHA-256 hash of the password, and modman keeps that hash.
 
