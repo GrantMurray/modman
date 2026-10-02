@@ -8,7 +8,7 @@ HISTORY_FILE="${ROOT_DIR}/data/.modman_history"
 MINECRAFT_ROOT="/srv/minecraft"
 SYSTEMD_SERVICE="mc-servers.service"
 SYSTEMD_UNIT="/etc/systemd/system/${SYSTEMD_SERVICE}"
-SYSTEMD_HELPER="/usr/local/bin/start_mc_servers.sh"
+SYSTEMD_HELPER="/usr/local/bin/start_mc_servers"
 
 usage() {
 	cat <<EOF
@@ -23,8 +23,7 @@ Status values (STATUS column only — start/stop/restart use live screen presenc
   running                    Screen is up and startup finished (Done (Xs)!)
 
 Commands:
-  list                       Show modpacks currently in the index
-  available                  Show modpack dirs under ${MINECRAFT_ROOT} not in the index
+  list                       Display all modpacks in /srv/minecraft
   status [MODPACK]           Show running/stopped state (all indexed, or one pack)
   usage [MODPACK]            Show CPU, RAM, and uptime (all indexed, or one pack)
   start [MODPACK]            Start a stopped pack, or all stopped indexed packs
@@ -38,8 +37,11 @@ Commands:
   service enable             Enable ${SYSTEMD_SERVICE} to start at boot
   service disable            Disable ${SYSTEMD_SERVICE} from starting at boot
   service install            Install ${SYSTEMD_SERVICE} to run as the current user
-  add MODPACK                Add a modpack to the index
-  remove MODPACK             Stop a running pack (if needed), then remove from index
+  install                    Search CurseForge and install a server pack
+  update MODPACK             Install a newer CurseForge server pack into an existing folder
+  enable MODPACK             Put a pack in the index so it starts with the others
+  disable MODPACK            Stop a running pack (if needed), then take it out of the index
+  uninstall MODPACK          Ask, then delete the pack folder from disk
   rename OLD NEW             Rename a modpack dir and update the index if present
   port MODPACK PORT          Set a modpack's server-port in server.properties
   help                       Show this help
@@ -61,8 +63,11 @@ Examples:
   service restart
   service enable
   service install
-  add Ascendra
-  remove Linggango
+  install
+  update Cobbleverse
+  enable Ascendra
+  disable Linggango
+  uninstall Linggango
   rename MonkeyMine MonkeyMine2
   port Cobbleverse 25570
 EOF
@@ -388,17 +393,13 @@ list_index() {
 	read_index
 	if ((${#INDEX_ENTRIES[@]} == 0)); then
 		echo "Index is empty: $INDEX_FILE"
-		return 0
+	else
+		echo "Indexed modpacks ($INDEX_FILE):"
+		print_indexed_status_table
 	fi
 
-	echo "Indexed modpacks ($INDEX_FILE):"
-	print_indexed_status_table
-}
-
-list_available() {
-	read_index
 	local names=()
-	local dir name
+	local dir name width
 	for dir in "$MINECRAFT_ROOT"/*/; do
 		[[ -d "$dir" ]] || continue
 		name="$(basename "$dir")"
@@ -407,13 +408,12 @@ list_available() {
 			names+=("$name")
 		fi
 	done
-
 	if ((${#names[@]} == 0)); then
-		echo "No available modpacks outside the index."
 		return 0
 	fi
 
-	local width
+	echo
+	echo "Not in the index:"
 	width="$(max_name_width "${names[@]}")"
 	print_table_header "$(printf "%-${width}s  %-4s  %s" "MODPACK" "JAVA" "PORT")"
 	for name in "${names[@]}"; do
@@ -446,7 +446,7 @@ add_modpack() {
 
 	INDEX_ENTRIES+=("$name")
 	write_index
-	echo "Added '$name' to $INDEX_FILE"
+	echo "Enabled '$name' in $INDEX_FILE"
 }
 
 remove_modpack() {
@@ -475,7 +475,74 @@ remove_modpack() {
 	done
 	INDEX_ENTRIES=("${updated[@]+"${updated[@]}"}")
 	write_index
-	echo "Removed '$name' from $INDEX_FILE"
+	echo "Disabled '$name' in $INDEX_FILE"
+}
+
+uninstall_modpack() {
+	local name="${1:-}"
+	local dest answer
+	local running=0 indexed=0
+	if [[ -z "$name" ]]; then
+		echo "Error: missing modpack name." >&2
+		return 1
+	fi
+	if ! valid_modpack_name "$name"; then
+		echo "Error: '$name' is not a modpack name." >&2
+		return 1
+	fi
+
+	dest="${MINECRAFT_ROOT}/${name}"
+	if [[ -L "$dest" ]]; then
+		echo "Error: '$dest' is a symlink." >&2
+		return 1
+	fi
+	if [[ ! -d "$dest" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+
+	read_index
+	if is_running "$name"; then
+		running=1
+	fi
+	if in_index "$name"; then
+		indexed=1
+	fi
+
+	echo "Delete ${dest}, including its world?"
+	if ((running)); then
+		echo "The server is running and will be stopped first."
+	fi
+	if ((indexed)); then
+		echo "It will also be taken out of the index."
+	fi
+	if ! read -r -e -p "Type yes to confirm: " answer; then
+		echo
+		return 1
+	fi
+	if [[ "${answer,,}" != "yes" ]]; then
+		echo "Cancelled."
+		return 0
+	fi
+
+	if ((running)); then
+		stop_one "$name" || return 1
+	fi
+	if ((indexed)); then
+		local updated=()
+		local entry
+		for entry in "${INDEX_ENTRIES[@]}"; do
+			[[ "$entry" == "$name" ]] && continue
+			updated+=("$entry")
+		done
+		INDEX_ENTRIES=("${updated[@]+"${updated[@]}"}")
+		write_index
+	fi
+	if ! rm -rf "$dest"; then
+		echo "Error: failed to delete $dest" >&2
+		return 1
+	fi
+	echo "Uninstalled '$name' (${dest})"
 }
 
 valid_modpack_name() {
@@ -1067,6 +1134,705 @@ service_control() {
 	esac
 }
 
+# CurseForge: Minecraft is game 432, modpacks are class 4471.
+# Search sortField 2 is popularity.
+CF_API="https://api.curseforge.com/v1"
+CF_KEY_FILE="${ROOT_DIR}/data/curseforge-api-key"
+
+read_curseforge_key() {
+	local key=""
+	if [[ ! -s "$CF_KEY_FILE" ]]; then
+		echo "Error: put a CurseForge API key in $CF_KEY_FILE (one line)." >&2
+		echo "Create one at https://console.curseforge.com" >&2
+		return 1
+	fi
+	IFS= read -r key <"$CF_KEY_FILE" || true
+	key="${key#"${key%%[![:space:]]*}"}"
+	key="${key%"${key##*[![:space:]]}"}"
+	if [[ -z "$key" ]]; then
+		echo "Error: $CF_KEY_FILE is empty." >&2
+		return 1
+	fi
+	printf '%s' "$key"
+}
+
+# Print the response body. On failure, print the HTTP status and return 1.
+cf_api_get() {
+	local key="$1"
+	local url="$2"
+	local body http
+	body="$(mktemp)"
+	if ! http="$(curl -sS --retry 2 -A modman -H "Accept: application/json" -H "x-api-key: ${key}" -o "$body" -w "%{http_code}" "$url")"; then
+		rm -f "$body"
+		echo "Error: CurseForge request failed." >&2
+		return 1
+	fi
+	if [[ "$http" != 2* ]]; then
+		echo "Error: CurseForge returned HTTP ${http}." >&2
+		python3 - "$body" <<'PY' >&2 || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+msg = data.get("errorMessage") or data.get("message")
+if isinstance(msg, str) and msg:
+    print(msg)
+PY
+		rm -f "$body"
+		return 1
+	fi
+	cat "$body"
+	rm -f "$body"
+}
+
+# Folder name matching the packs already under /srv/minecraft: the CurseForge
+# name with spaces removed, and other punctuation dropped.
+pack_dir_name() {
+	python3 - "$1" <<'PY'
+import re, sys
+name = re.sub(r"\s+", "", sys.argv[1])
+name = re.sub(r"[^A-Za-z0-9._-]", "", name)
+if not name or name in {".", ".."}:
+    sys.exit(1)
+sys.stdout.write(name)
+PY
+}
+
+# Run the python program on stdin. argv[1] is a file containing the JSON in $1.
+run_python_on_json() {
+	local json="$1"
+	local file status=0
+	file="$(mktemp)"
+	printf '%s\n' "$json" >"$file"
+	python3 - "$file" || status=$?
+	rm -f "$file"
+	return "$status"
+}
+
+# TSV: id, name, download count, summary. Empty output means no matches.
+cf_search_modpacks() {
+	local key="$1"
+	local query="$2"
+	local encoded body
+	encoded="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$query")"
+	body="$(cf_api_get "$key" "${CF_API}/mods/search?gameId=432&classId=4471&pageSize=10&sortField=2&sortOrder=desc&searchFilter=${encoded}")" || return 1
+	run_python_on_json "$body" <<'PY'
+import json, sys
+mods = (json.load(open(sys.argv[1])).get("data") or [])
+for mod in mods:
+    name = (mod.get("name") or "").replace("\t", " ").replace("\n", " ").strip()
+    summary = (mod.get("summary") or "").replace("\t", " ").replace("\n", " ").strip()
+    if len(summary) > 110:
+        summary = summary[:107] + "..."
+    downloads = f"{int(mod.get('downloadCount') or 0):,}"
+    print(f"{mod.get('id')}\t{name}\t{downloads}\t{summary}")
+PY
+}
+
+# Newest release that has a server pack. Prints the server-pack file id.
+# Returns 2 when the project has no server pack.
+cf_server_pack_file() {
+	local key="$1"
+	local mod_id="$2"
+	local body status=0
+	body="$(cf_api_get "$key" "${CF_API}/mods/${mod_id}/files?pageSize=50")" || return 1
+	run_python_on_json "$body" <<'PY' || status=$?
+import json, sys
+files = json.load(open(sys.argv[1])).get("data") or []
+files.sort(key=lambda f: f.get("fileDate") or "", reverse=True)
+
+def first(pred):
+    for f in files:
+        if pred(f):
+            return f
+    return None
+
+def release(f):
+    return f.get("releaseType") == 1
+
+chosen = None
+hit = first(lambda f: release(f) and f.get("serverPackFileId"))
+if hit:
+    chosen = hit["serverPackFileId"]
+if chosen is None:
+    hit = first(lambda f: release(f) and f.get("isServerPack"))
+    if hit:
+        chosen = hit["id"]
+if chosen is None:
+    hit = first(lambda f: f.get("serverPackFileId"))
+    if hit:
+        chosen = hit["serverPackFileId"]
+if chosen is None:
+    hit = first(lambda f: f.get("isServerPack"))
+    if hit:
+        chosen = hit["id"]
+if chosen is None:
+    sys.exit(2)
+print(chosen)
+PY
+	if ((status == 2)); then
+		echo "Error: that modpack has no server pack on CurseForge." >&2
+		return 1
+	fi
+	if ((status != 0)); then
+		echo "Error: could not read the CurseForge file list." >&2
+		return 1
+	fi
+}
+
+# TSV: display name, file name, Minecraft versions.
+cf_file_meta() {
+	local key="$1"
+	local mod_id="$2"
+	local file_id="$3"
+	local body
+	body="$(cf_api_get "$key" "${CF_API}/mods/${mod_id}/files/${file_id}")" || return 1
+	run_python_on_json "$body" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1])).get("data") or {}
+display = (data.get("displayName") or data.get("fileName") or "server pack").replace("\t", " ").replace("\n", " ")
+filename = (data.get("fileName") or "server-pack.zip").replace("\t", " ").replace("\n", " ")
+versions = []
+for version in data.get("gameVersions") or []:
+    if "." in version and any(ch.isdigit() for ch in version):
+        versions.append(version)
+print(f"{display}\t{filename}\t{', '.join(versions)}")
+PY
+}
+
+cf_download_url() {
+	local key="$1"
+	local mod_id="$2"
+	local file_id="$3"
+	local body
+	body="$(cf_api_get "$key" "${CF_API}/mods/${mod_id}/files/${file_id}/download-url")" || return 1
+	run_python_on_json "$body" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1])).get("data")
+if isinstance(data, dict):
+    data = data.get("url") or data.get("downloadUrl")
+if not isinstance(data, str) or not data:
+    sys.exit(1)
+print(data)
+PY
+}
+
+# Unpack a server-pack zip and print the pack directory.
+cf_extract_root() {
+	local zip="$1"
+	local dest="$2"
+	python3 - "$zip" "$dest" <<'PY'
+import os, sys, zipfile
+zip_path, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(zip_path) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if name.startswith("/") or any(p == ".." for p in parts):
+            sys.stderr.write(f"Error: archive path escapes the pack: {info.filename}\n")
+            sys.exit(1)
+    zf.extractall(dest)
+
+HINTS = {"start.sh", "run.sh", "startserver.sh", "start_server.sh", "serverstart.sh", "server.jar", "user_jvm_args.txt"}
+
+def hinted(filenames):
+    if HINTS.intersection(filenames):
+        return True
+    for name in filenames:
+        lower = name.lower()
+        if lower.endswith(".jar") and "installer" not in lower and "server" in lower:
+            return True
+    return False
+
+found = []
+for dirpath, dirnames, filenames in os.walk(dest):
+    dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
+    rel = os.path.relpath(dirpath, dest)
+    depth = 0 if rel == "." else rel.count(os.sep) + 1
+    if depth > 2:
+        dirnames[:] = []
+        continue
+    if hinted(filenames):
+        found.append((depth, dirpath, "start.sh" in filenames))
+if found:
+    found.sort(key=lambda item: (0 if item[2] else 1, item[0]))
+    kind = found[0][2]
+    depth = found[0][0]
+    best = [path for item_depth, path, has_start in found if item_depth == depth and has_start == kind]
+    if len(best) != 1:
+        sys.stderr.write("Error: server pack has more than one launch directory\n")
+        sys.exit(1)
+    print(best[0])
+    sys.exit(0)
+
+print(dest)
+PY
+}
+
+# Write start.sh when the pack did not ship one. Prints "generated" on success.
+cf_write_start_sh() {
+	local root="$1"
+	python3 - "$root" <<'PY'
+import os, stat, sys
+root = sys.argv[1]
+dest = os.path.join(root, "start.sh")
+if os.path.exists(dest):
+    sys.exit(0)
+
+def sh_quote(text):
+    return "'" + text.replace("'", "'\\''") + "'"
+
+def write(body, also_exec=None):
+    with open(dest, "w", newline="\n") as fh:
+        fh.write(body)
+    os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if also_exec:
+        path = os.path.join(root, also_exec)
+        if os.path.isfile(path):
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print("generated")
+
+header = "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+for name in ("run.sh", "startserver.sh", "start_server.sh", "serverstart.sh"):
+    if os.path.isfile(os.path.join(root, name)):
+        write(header + f"exec ./{sh_quote(name)} nogui\n", name)
+        sys.exit(0)
+
+unix = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
+    if "unix_args.txt" in filenames:
+        unix.append(os.path.relpath(os.path.join(dirpath, "unix_args.txt"), root))
+if len(unix) > 1:
+    sys.stderr.write("Error: server pack has more than one unix_args.txt\n")
+    sys.exit(1)
+if len(unix) == 1:
+    args = sh_quote(unix[0])
+    if os.path.isfile(os.path.join(root, "user_jvm_args.txt")):
+        write(header + f"exec java @user_jvm_args.txt @{args} nogui\n")
+    else:
+        write(header + f"exec java -Xms4G -Xmx8G @{args} nogui\n")
+    sys.exit(0)
+
+jars = []
+for name in os.listdir(root):
+    if name.lower().endswith(".jar") and os.path.isfile(os.path.join(root, name)):
+        if "installer" not in name.lower():
+            jars.append(name)
+
+def rank(name):
+    lower = name.lower()
+    if lower == "server.jar":
+        return 0
+    if "server" in lower:
+        return 1
+    return 5
+
+if jars:
+    jars.sort(key=lambda name: (rank(name), name))
+    best = rank(jars[0])
+    tied = [name for name in jars if rank(name) == best]
+    lone = jars[0].lower()
+    lone_ok = any(token in lone for token in ("forge", "fabric", "neoforge", "minecraft", "server", "quilt"))
+    if best < 5 or (len(jars) == 1 and lone_ok):
+        if len(tied) == 1:
+            jar = sh_quote(tied[0])
+            if os.path.isfile(os.path.join(root, "user_jvm_args.txt")):
+                write(header + f"exec java @user_jvm_args.txt -jar {jar} nogui\n")
+            else:
+                write(header + f"exec java -Xms4G -Xmx8G -jar {jar} nogui\n")
+            sys.exit(0)
+
+sys.stderr.write("Error: server pack has no start.sh, run script, or server jar\n")
+sys.exit(1)
+PY
+}
+
+# Ask for a search string. Prints the trimmed query on stdout.
+cf_prompt_modpack_query() {
+	local query
+	echo "What modpack would you like to search for?" >&2
+	if ! read -r -e -p "Modpack: " query; then
+		echo
+		return 1
+	fi
+	query="${query#"${query%%[![:space:]]*}"}"
+	query="${query%"${query##*[![:space:]]}"}"
+	if [[ -z "$query" ]]; then
+		echo "Error: enter a modpack name." >&2
+		return 1
+	fi
+	printf '%s\n' "$query"
+}
+
+# Search and let the user pick. Prints "id<TAB>name" on success.
+# Returns 2 when nothing matches, 3 when the user cancels.
+cf_select_modpack() {
+	local key="$1"
+	local query="$2"
+	local tsv id name downloads summary
+	local -a ids=() names=()
+	local n=0 choice idx
+
+	echo "Searching CurseForge..." >&2
+	tsv="$(cf_search_modpacks "$key" "$query")" || return 1
+	while IFS=$'\t' read -r id name downloads summary; do
+		[[ -n "$id" ]] || continue
+		n=$((n + 1))
+		ids+=("$id")
+		names+=("$name")
+		printf '  %2d  %s  (id %s)\n' "$n" "$name" "$id" >&2
+		if [[ -n "$summary" ]]; then
+			printf '      %s downloads. %s\n' "$downloads" "$summary" >&2
+		else
+			printf '      %s downloads.\n' "$downloads" >&2
+		fi
+	done <<<"$tsv"
+	if ((n == 0)); then
+		echo "No modpacks matched '$query'." >&2
+		return 2
+	fi
+
+	if ! read -r -e -p "Select a modpack by number, or press Enter to cancel: " choice; then
+		echo
+		return 1
+	fi
+	if [[ -z "$choice" ]]; then
+		echo "Cancelled." >&2
+		return 3
+	fi
+	if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+		echo "Error: '$choice' is not a number in the list." >&2
+		return 1
+	fi
+	choice=$((10#$choice))
+	if ((choice < 1 || choice > n)); then
+		echo "Error: '$choice' is not a number in the list." >&2
+		return 1
+	fi
+
+	idx=$((choice - 1))
+	printf '%s\t%s\n' "${ids[$idx]}" "${names[$idx]}"
+}
+
+# Read .curseforge-id. Prints "project_id<TAB>file_id" (file_id may be empty).
+# Returns 2 when the project id is missing.
+read_curseforge_id() {
+	local file="$1"
+	local line id="" file_id=""
+	[[ -f "$file" ]] || return 2
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		case "$line" in
+			id=*) id="${line#id=}" ;;
+			file=*) file_id="${line#file=}" ;;
+		esac
+	done <"$file"
+	id="${id//[[:space:]]/}"
+	file_id="${file_id//[[:space:]]/}"
+	[[ "$id" =~ ^[0-9]+$ ]] || return 2
+	if [[ -n "$file_id" && ! "$file_id" =~ ^[0-9]+$ ]]; then
+		file_id=""
+	fi
+	printf '%s\t%s\n' "$id" "$file_id"
+}
+
+# Download and unpack a server pack. Prints workdir, pack root, and whether
+# start.sh was generated ("generated" or "-").
+cf_stage_server_pack() {
+	local key="$1"
+	local mod_id="$2"
+	local file_id="$3"
+	local url work zip root generated="-"
+
+	url="$(cf_download_url "$key" "$mod_id" "$file_id")" || return 1
+	work="$(mktemp -d)"
+	zip="${work}/pack.zip"
+	if ! curl -fL --retry 2 -A modman -H "x-api-key: ${key}" -o "$zip" -# "$url"; then
+		rm -rf "$work"
+		echo "Error: download failed." >&2
+		return 1
+	fi
+	if ! root="$(cf_extract_root "$zip" "${work}/pack")"; then
+		rm -rf "$work"
+		return 1
+	fi
+	if [[ ! -f "$root/start.sh" ]]; then
+		if ! generated="$(cf_write_start_sh "$root")"; then
+			rm -rf "$work"
+			return 1
+		fi
+	fi
+	printf '%s\n%s\n%s\n' "$work" "$root" "$generated"
+}
+
+# Replace dest with the staged pack. Keep the world and local server files.
+cf_replace_pack() {
+	local name="$1"
+	local root="$2"
+	local dest="${MINECRAFT_ROOT}/${name}"
+	local backup="${MINECRAFT_ROOT}/.modman-update-${name}"
+	local hold item
+	local -a keep=(
+		world world_nether world_the_end
+		server.properties ops.json whitelist.json
+		banned-players.json banned-ips.json eula.txt
+	)
+
+	if [[ -e "$backup" ]]; then
+		echo "Error: '$backup' already exists. Move it aside before updating." >&2
+		return 1
+	fi
+	hold="$(mktemp -d)"
+	for item in "${keep[@]}"; do
+		if [[ -e "$dest/$item" || -L "$dest/$item" ]]; then
+			mv "$dest/$item" "$hold/$item"
+		fi
+	done
+	if ! mv "$dest" "$backup"; then
+		mkdir -p "$dest"
+		for item in "${keep[@]}"; do
+			if [[ -e "$hold/$item" || -L "$hold/$item" ]]; then
+				mv "$hold/$item" "$dest/$item"
+			fi
+		done
+		rm -rf "$hold"
+		echo "Error: failed to move $dest aside." >&2
+		return 1
+	fi
+	if ! mkdir "$dest"; then
+		mv "$backup" "$dest"
+		for item in "${keep[@]}"; do
+			if [[ -e "$hold/$item" || -L "$hold/$item" ]]; then
+				rm -rf "$dest/$item"
+				mv "$hold/$item" "$dest/$item"
+			fi
+		done
+		rm -rf "$hold"
+		echo "Error: failed to create $dest" >&2
+		return 1
+	fi
+	if ! cp -a "${root}/." "$dest/"; then
+		rm -rf "$dest"
+		mv "$backup" "$dest"
+		for item in "${keep[@]}"; do
+			if [[ -e "$hold/$item" || -L "$hold/$item" ]]; then
+				rm -rf "$dest/$item"
+				mv "$hold/$item" "$dest/$item"
+			fi
+		done
+		rm -rf "$hold"
+		echo "Error: failed to copy the server pack into $dest" >&2
+		return 1
+	fi
+	for item in "${keep[@]}"; do
+		if [[ -e "$hold/$item" || -L "$hold/$item" ]]; then
+			rm -rf "$dest/$item"
+			mv "$hold/$item" "$dest/$item"
+		fi
+	done
+	rm -rf "$hold" "$backup"
+}
+
+install_modpack() {
+	local key query picked select_status=0
+	local mod_id mod_name folder dest
+	local file_id meta display versions
+	local staged work root generated status=0
+
+	if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+		echo "Error: install needs curl and python3." >&2
+		return 1
+	fi
+	if [[ ! -d "$MINECRAFT_ROOT" ]]; then
+		echo "Error: $MINECRAFT_ROOT does not exist." >&2
+		return 1
+	fi
+	key="$(read_curseforge_key)" || return 1
+	query="$(cf_prompt_modpack_query)" || return 1
+	picked="$(cf_select_modpack "$key" "$query")" || select_status=$?
+	if ((select_status == 2 || select_status == 3)); then
+		return 0
+	fi
+	if ((select_status != 0)); then
+		return 1
+	fi
+	IFS=$'\t' read -r mod_id mod_name <<<"$picked"
+	if ! folder="$(pack_dir_name "$mod_name")"; then
+		echo "Error: cannot make a folder name from '$mod_name'." >&2
+		return 1
+	fi
+	dest="${MINECRAFT_ROOT}/${folder}"
+	if [[ -e "$dest" ]]; then
+		echo "Error: '$dest' already exists." >&2
+		return 1
+	fi
+
+	echo "Looking up the server pack for ${mod_name}..."
+	file_id="$(cf_server_pack_file "$key" "$mod_id")" || return 1
+	meta="$(cf_file_meta "$key" "$mod_id" "$file_id")" || return 1
+	IFS=$'\t' read -r display _ versions <<<"$meta"
+
+	if [[ -n "$versions" ]]; then
+		echo "Installing ${display} (Minecraft ${versions}) into ${dest}"
+	else
+		echo "Installing ${display} into ${dest}"
+	fi
+
+	staged="$(cf_stage_server_pack "$key" "$mod_id" "$file_id")" || return 1
+	{
+		IFS= read -r work
+		IFS= read -r root
+		IFS= read -r generated
+	} <<<"$staged"
+	if ! mkdir "$dest"; then
+		rm -rf "$work"
+		echo "Error: failed to create $dest" >&2
+		return 1
+	fi
+	if ! cp -a "${root}/." "$dest/"; then
+		rm -rf "$dest" "$work"
+		echo "Error: failed to copy the server pack into $dest" >&2
+		return 1
+	fi
+	rm -rf "$work"
+	chmod +x "$dest/start.sh" || status=$?
+	if ((status != 0)); then
+		rm -rf "$dest"
+		echo "Error: failed to make start.sh executable." >&2
+		return 1
+	fi
+	if ! printf 'id=%s\nfile=%s\n' "$mod_id" "$file_id" >"$dest/.curseforge-id"; then
+		rm -rf "$dest"
+		echo "Error: failed to write $dest/.curseforge-id" >&2
+		return 1
+	fi
+
+	echo "Installed ${mod_name} in ${dest}"
+	if [[ "$generated" == "generated" ]]; then
+		echo "Wrote start.sh; the server pack did not include one."
+	fi
+	echo "CurseForge project id ${mod_id} saved in ${dest}/.curseforge-id"
+	echo "Enable it with: enable ${folder}"
+}
+
+update_modpack() {
+	local name="${1:-}"
+	local dest id_file key picked select_status=0
+	local mod_id="" mod_name="" known_file=""
+	local file_id meta display versions answer
+	local staged work root generated status=0
+	local was_running=0
+
+	if [[ -z "$name" ]]; then
+		echo "Error: missing modpack name." >&2
+		return 1
+	fi
+	if ! valid_modpack_name "$name"; then
+		echo "Error: '$name' is not a modpack name." >&2
+		return 1
+	fi
+	if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+		echo "Error: update needs curl and python3." >&2
+		return 1
+	fi
+	dest="${MINECRAFT_ROOT}/${name}"
+	if [[ -L "$dest" ]]; then
+		echo "Error: '$dest' is a symlink." >&2
+		return 1
+	fi
+	if [[ ! -d "$dest" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	key="$(read_curseforge_key)" || return 1
+
+	id_file="${dest}/.curseforge-id"
+	if picked="$(read_curseforge_id "$id_file")"; then
+		IFS=$'\t' read -r mod_id known_file <<<"$picked"
+		mod_name="$name"
+	else
+		echo "No CurseForge id in ${id_file}."
+		echo "Searching CurseForge for '${name}'..."
+		picked="$(cf_select_modpack "$key" "$name")" || select_status=$?
+		if ((select_status == 2)); then
+			echo "Search by the name used on CurseForge."
+			select_status=0
+			picked="$(cf_prompt_modpack_query)" || return 1
+			picked="$(cf_select_modpack "$key" "$picked")" || select_status=$?
+		fi
+		if ((select_status == 2 || select_status == 3)); then
+			return 0
+		fi
+		if ((select_status != 0)); then
+			return 1
+		fi
+		IFS=$'\t' read -r mod_id mod_name <<<"$picked"
+	fi
+
+	echo "Looking up the server pack for ${mod_name}..."
+	file_id="$(cf_server_pack_file "$key" "$mod_id")" || return 1
+	if [[ -n "$known_file" && "$known_file" == "$file_id" ]]; then
+		echo "'${name}' is already on server pack file ${file_id}."
+		return 0
+	fi
+	meta="$(cf_file_meta "$key" "$mod_id" "$file_id")" || return 1
+	IFS=$'\t' read -r display _ versions <<<"$meta"
+
+	if [[ -n "$versions" ]]; then
+		echo "Update ${name} to ${display} (Minecraft ${versions})?"
+	else
+		echo "Update ${name} to ${display}?"
+	fi
+	echo "The world, server.properties, ops, whitelist, bans, and eula.txt are kept."
+	if is_running "$name"; then
+		was_running=1
+		echo "The server is running and will be stopped first."
+	fi
+	if ! read -r -e -p "Type yes to confirm: " answer; then
+		echo
+		return 1
+	fi
+	if [[ "${answer,,}" != "yes" ]]; then
+		echo "Cancelled."
+		return 0
+	fi
+
+	if ((was_running)); then
+		stop_one "$name" || return 1
+	fi
+
+	staged="$(cf_stage_server_pack "$key" "$mod_id" "$file_id")" || return 1
+	{
+		IFS= read -r work
+		IFS= read -r root
+		IFS= read -r generated
+	} <<<"$staged"
+	if ! cf_replace_pack "$name" "$root"; then
+		rm -rf "$work"
+		return 1
+	fi
+	rm -rf "$work"
+	if ! printf 'id=%s\nfile=%s\n' "$mod_id" "$file_id" >"$dest/.curseforge-id"; then
+		echo "Error: failed to write $dest/.curseforge-id" >&2
+		return 1
+	fi
+	chmod +x "$dest/start.sh" || status=$?
+	if ((status != 0)); then
+		echo "Error: failed to make start.sh executable." >&2
+		return 1
+	fi
+
+	echo "Updated '${name}' in ${dest}"
+	if [[ "$generated" == "generated" ]]; then
+		echo "Wrote start.sh; the server pack did not include one."
+	fi
+	echo "CurseForge project id ${mod_id} saved in ${dest}/.curseforge-id"
+	if ((was_running)); then
+		echo "Start it with: start ${name}"
+	fi
+}
+
 require_arg() {
 	local cmd="$1"
 	local value="${2:-}"
@@ -1105,9 +1871,6 @@ dispatch() {
 		list)
 			list_index
 			;;
-		available)
-			list_available
-			;;
 		status)
 			show_status "${1:-}" || return 1
 			;;
@@ -1130,13 +1893,24 @@ dispatch() {
 		service)
 			service_control "${1:-}" || return 1
 			;;
-		add)
+		install)
+			install_modpack || return 1
+			;;
+		update)
+			require_arg "$cmd" "${1:-}" || return 1
+			update_modpack "$1" || return 1
+			;;
+		enable)
 			require_arg "$cmd" "${1:-}" || return 1
 			add_modpack "$1" || return 1
 			;;
-		remove|rm)
+		disable)
 			require_arg "$cmd" "${1:-}" || return 1
 			remove_modpack "$1" || return 1
+			;;
+		uninstall)
+			require_arg "$cmd" "${1:-}" || return 1
+			uninstall_modpack "$1" || return 1
 			;;
 		rename|mv)
 			require_two_args "$cmd" "${1:-}" "${2:-}" || return 1
@@ -1192,7 +1966,7 @@ _repl_candidates() {
 	local -a words=()
 
 	if ((cword == 0)); then
-		_ci_matches "$cur" list available status usage start stop restart join service add remove rm rename mv port help exit
+		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port help exit
 		return 0
 	fi
 
@@ -1202,16 +1976,22 @@ _repl_candidates() {
 				_ci_matches "$cur" status start stop restart enable disable install
 			fi
 			;;
-		add)
+		enable)
 			if ((cword == 1)); then
 				mapfile -t words < <(available_modpack_names || true)
 				_ci_matches "$cur" ${words[@]+"${words[@]}"}
 			fi
 			;;
-		remove|rm)
+		disable)
 			if ((cword == 1)); then
 				read_index
 				_ci_matches "$cur" ${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}
+			fi
+			;;
+		uninstall|update)
+			if ((cword == 1)); then
+				mapfile -t words < <(all_modpack_names || true)
+				_ci_matches "$cur" ${words[@]+"${words[@]}"}
 			fi
 			;;
 		rename|mv|port)
