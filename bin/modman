@@ -177,13 +177,16 @@ java_bin_for() {
 	local bin="" line
 
 	if [[ -f "$start" ]]; then
-		line="$(grep -E '^[[:space:]]*(exec[[:space:]]+)?(/[^[:space:]]*/java|java)([[:space:]]|$)' "$start" | head -n1 || true)"
+		line="$(grep -E "^[[:space:]]*(exec[[:space:]]+)?['\"]?(/[^[:space:]'\"]*/java|java)['\"]?([[:space:]]|\$)" "$start" | head -n1 || true)"
 		line="${line#"${line%%[![:space:]]*}"}"
 		if [[ "$line" == exec[[:space:]]* ]]; then
 			line="${line#exec}"
 			line="${line#"${line%%[![:space:]]*}"}"
 		fi
 		bin="${line%%[[:space:]]*}"
+		# Generated scripts quote the java path.
+		bin="${bin//\'/}"
+		bin="${bin//\"/}"
 	fi
 
 	if [[ -z "$bin" && -f "$vars" ]]; then
@@ -850,31 +853,47 @@ format_elapsed() {
 }
 
 # CPU, RAM, and uptime of the pack's Java process. "-" when it is not running.
-pack_usage_cells() {
-	local name="$1"
-	if ! pack_stays_inside "$name"; then
-		printf '%s\n' "-" "-" "-"
-		return 0
-	fi
-	local pack_dir="$MINECRAFT_ROOT/$name"
-	local pid cwd comm stats pcpu rss etime
+# CPU, RAM, and uptime for every pack with a running java process, from one
+# pass over /proc and one ps call. Fills the associative array named by $1 with
+# name -> "cpu<TAB>ram<TAB>uptime". Packs with no java process are left out.
+collect_pack_usage() {
+	local -n usage_out="$1"
+	local name pid pcpu rss etime list
+	local -A pids=() by_pid=()
 
-	for pid in /proc/[0-9]*; do
-		pid="${pid#/proc/}"
-		cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
-		[[ "$cwd" == "$pack_dir" ]] || continue
-		comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
-		[[ "$comm" == "java" ]] || continue
-		stats="$(ps -p "$pid" -o pcpu=,rss=,etime= 2>/dev/null || true)"
-		[[ -n "$stats" ]] || continue
-		read -r pcpu rss etime <<<"$stats"
-		printf '%s\n' "$(printf '%.1f%%' "$pcpu")"
-		printf '%s\n' "$(format_ram_kb "$rss")"
-		printf '%s\n' "$(format_elapsed "$etime")"
-		return 0
+	while IFS=$'\t' read -r name pid; do
+		[[ -n "$name" && -z "${pids[$name]:-}" ]] && pids["$name"]="$pid"
+	done < <(python3 - "$MINECRAFT_ROOT" <<'PY'
+import os, sys
+root = os.path.normpath(sys.argv[1])
+# Lexical order, as the old /proc/[0-9]* glob walked it.
+for pid in sorted(os.listdir("/proc")):
+    if not pid.isdigit():
+        continue
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+        with open(f"/proc/{pid}/comm") as fh:
+            comm = fh.read().strip()
+    except OSError:
+        continue
+    if comm != "java":
+        continue
+    parent, name = os.path.split(cwd)
+    if parent == root and name and "\t" not in name and "\n" not in name:
+        print(f"{name}\t{pid}")
+PY
+	)
+	((${#pids[@]})) || return 0
+
+	for name in "${!pids[@]}"; do
+		by_pid["${pids[$name]}"]="$name"
 	done
-
-	printf '%s\n' "-" "-" "-"
+	list="$(IFS=,; printf '%s' "${pids[*]}")"
+	while read -r pid pcpu rss etime; do
+		name="${by_pid[$pid]:-}"
+		[[ -n "$name" ]] || continue
+		usage_out["$name"]="$(printf '%.1f%%' "$pcpu")"$'\t'"$(format_ram_kb "$rss")"$'\t'"$(format_elapsed "$etime")"
+	done < <(ps -o pid=,pcpu=,rss=,etime= -p "$list" 2>/dev/null || true)
 }
 
 print_usage_table() {
@@ -882,12 +901,15 @@ print_usage_table() {
 	width="$(max_name_width "$@")"
 	print_table_header "$(printf "%-${width}s  %-6s  %-8s  %s" "MODPACK" "CPU" "RAM" "UPTIME")"
 	local name cpu ram uptime
+	local -A usage=()
+	collect_pack_usage usage
 	for name in "$@"; do
-		{
-			read -r cpu
-			read -r ram
-			read -r uptime
-		} < <(pack_usage_cells "$name")
+		cpu="-"
+		ram="-"
+		uptime="-"
+		if [[ -n "${usage[$name]:-}" ]] && pack_stays_inside "$name"; then
+			IFS=$'\t' read -r cpu ram uptime <<<"${usage[$name]}"
+		fi
 		printf "%-${width}s  %-6s  %-8s  %s\n" "$name" "$cpu" "$ram" "$uptime"
 	done
 }
@@ -951,6 +973,72 @@ launch_server_screen() {
 		|| return 1
 }
 
+MINECRAFT_EULA_URL="https://aka.ms/MinecraftEULA"
+
+# True when the pack's eula.txt has eula=true.
+eula_accepted() {
+	local pack_dir="$1"
+	[[ -f "$pack_dir/eula.txt" ]] &&
+		grep -qiE '^[[:space:]]*eula[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$pack_dir/eula.txt"
+}
+
+eula_terms() {
+	local name="$1"
+	cat <<EOF
+'${name}' needs the Minecraft End User License Agreement (EULA) accepted before it can start.
+The full terms are at ${MINECRAFT_EULA_URL}
+By agreeing, you are indicating your agreement to the Minecraft EULA, and eula=true is written to ${name}/eula.txt.
+EOF
+}
+
+# Write eula=true, keeping any other lines in the file.
+accept_eula() {
+	local pack_dir="$1"
+	local file="$pack_dir/eula.txt"
+	if [[ -f "$file" ]] && grep -qiE '^[[:space:]]*eula[[:space:]]*=' "$file"; then
+		sed -i -E 's/^[[:space:]]*eula[[:space:]]*=.*/eula=true/I' "$file" || return 1
+	else
+		{
+			printf '#By changing the setting below to TRUE you are indicating your agreement to our EULA (%s).\n' "$MINECRAFT_EULA_URL"
+			printf '#%s\n' "$(date)"
+			printf 'eula=true\n'
+		} >>"$file" || return 1
+	fi
+}
+
+# Make sure the EULA is accepted before a start. Asks at the prompt; a web call
+# passes MODMAN_EULA=agree once the user agreed on the page.
+# Returns 0 when accepted, 3 when it was not.
+ensure_eula() {
+	local name="$1"
+	local pack_dir="$MINECRAFT_ROOT/$name"
+	local answer
+
+	if eula_accepted "$pack_dir"; then
+		return 0
+	fi
+	if [[ "${MODMAN_EULA:-}" != "agree" ]]; then
+		eula_terms "$name"
+		if [[ -n "${MODMAN_WEB_CALL:-}" || ! -t 0 ]]; then
+			echo "Not started: the EULA has not been accepted."
+			return 3
+		fi
+		if ! read -r -e -p "Do you agree to the Minecraft EULA? Type yes to agree: " answer; then
+			echo
+			answer=""
+		fi
+		if [[ "${answer,,}" != "yes" ]]; then
+			echo "Not started: the EULA was not accepted."
+			return 3
+		fi
+	fi
+	if ! accept_eula "$pack_dir"; then
+		echo "Error: failed to write $pack_dir/eula.txt" >&2
+		return 1
+	fi
+	echo "EULA accepted for '$name'."
+}
+
 start_one() {
 	local name="$1"
 	require_modpack "$name" || return 1
@@ -979,6 +1067,8 @@ start_one() {
 		return 0
 	fi
 
+	ensure_eula "$name" || return
+
 	if [[ -n "${MODMAN_WEB_CALL:-}" ]]; then
 		launch_server_screen "$name" "$session" "$pack_dir" || return 1
 	else
@@ -1003,18 +1093,29 @@ start_servers() {
 
 	local started=0
 	local skipped=0
-	local entry
+	local no_eula=0
+	local entry status
 	for entry in "${INDEX_ENTRIES[@]}"; do
 		if is_running "$entry"; then
 			echo "Skipping '$entry' (already running)."
 			skipped=$((skipped + 1))
 			continue
 		fi
-		start_one "$entry" || return 1
+		status=0
+		start_one "$entry" || status=$?
+		if ((status == 3)); then
+			no_eula=$((no_eula + 1))
+			continue
+		fi
+		((status == 0)) || return 1
 		started=$((started + 1))
 	done
 
-	echo "Done. Started $started, already running $skipped."
+	if ((no_eula)); then
+		echo "Done. Started $started, already running $skipped, EULA not accepted $no_eula."
+	else
+		echo "Done. Started $started, already running $skipped."
+	fi
 }
 
 stop_one() {
@@ -1101,6 +1202,10 @@ restart_servers() {
 		if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 			echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 			return 1
+		fi
+		# Ask before stopping, so a declined EULA does not leave the server down.
+		if [[ -d "$MINECRAFT_ROOT/$name" ]] && ! is_running "$name"; then
+			ensure_eula "$name" || return
 		fi
 		stop_one "$name" || return 1
 		sleep 1
@@ -1573,9 +1678,12 @@ PY
 }
 
 # Write start.sh when the pack did not ship one. Prints "generated" on success.
+# Returns 2 when the pack has nothing to launch. The optional java binary is used
+# in a generated script.
 cf_write_start_sh() {
 	local root="$1"
-	python3 - "$root" <<'PY'
+	local java="${2:-java}"
+	python3 - "$root" "$java" <<'PY'
 import os, stat, sys
 root = sys.argv[1]
 dest = os.path.join(root, "start.sh")
@@ -1596,6 +1704,9 @@ def write(body, also_exec=None):
     print("generated")
 
 header = "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+java = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "java"
+if java != "java":
+    java = sh_quote(java)
 files_here = {
     name.lower(): name
     for name in os.listdir(root)
@@ -1632,9 +1743,9 @@ if len(unix) > 1:
 if len(unix) == 1:
     args = sh_quote(unix[0])
     if os.path.isfile(os.path.join(root, "user_jvm_args.txt")):
-        write(header + f"exec java @user_jvm_args.txt @{args} nogui\n")
+        write(header + f"exec {java} @user_jvm_args.txt @{args} nogui\n")
     else:
-        write(header + f"exec java -Xms4G -Xmx8G @{args} nogui\n")
+        write(header + f"exec {java} -Xms4G -Xmx8G @{args} nogui\n")
     sys.exit(0)
 
 jars = []
@@ -1661,9 +1772,9 @@ if jars:
         if len(tied) == 1:
             jar = sh_quote(tied[0])
             if os.path.isfile(os.path.join(root, "user_jvm_args.txt")):
-                write(header + f"exec java @user_jvm_args.txt -jar {jar} nogui\n")
+                write(header + f"exec {java} @user_jvm_args.txt -jar {jar} nogui\n")
             else:
-                write(header + f"exec java -Xms4G -Xmx8G -jar {jar} nogui\n")
+                write(header + f"exec {java} -Xms4G -Xmx8G -jar {jar} nogui\n")
             sys.exit(0)
 
 installers = [
@@ -1674,18 +1785,153 @@ installers = [
 ]
 if len(installers) == 1:
     jar = sh_quote(installers[0])
+    # Forge 1.17 and newer writes run.sh. Older Forge writes forge-<version>.jar.
     write(
         header
-        + f"if [ ! -f ./run.sh ]; then\n"
-        + f"  java -jar {jar} --installServer\n"
-        + f"fi\n"
-        + "exec ./run.sh nogui\n"
+        + "if [ ! -f ./run.sh ] && [ ! -f ./.modman-installed ]; then\n"
+        + f"  {java} -jar {jar} --installServer || exit 1\n"
+        + "  touch ./.modman-installed\n"
+        + "fi\n"
+        + "if [ -f ./run.sh ]; then\n"
+        + "  exec sh ./run.sh nogui\n"
+        + "fi\n"
+        + "for jar in forge-*.jar; do\n"
+        + "  case \"$jar\" in\n"
+        + "  *installer*) ;;\n"
+        + f"  *) exec {java} -Xms4G -Xmx8G -jar \"$jar\" nogui ;;\n"
+        + "  esac\n"
+        + "done\n"
+        + "echo \"Forge server jar not found after install.\" >&2\n"
+        + "exit 1\n"
     )
     sys.exit(0)
 
-sys.stderr.write("Error: server pack has no start.sh, run script, or server jar\n")
-sys.exit(1)
+sys.exit(2)
 PY
+}
+
+# Loader the client pack's manifest asks for, for a server-pack file id.
+# Prints "loader<TAB>loader-version<TAB>minecraft-version", e.g. "forge	14.23.5.2860	1.12.2".
+cf_client_loader() {
+	local key="$1"
+	local mod_id="$2"
+	local file_id="$3"
+	local work="$4"
+	local body parent url zip
+	body="$(cf_api_get "$key" "${CF_API}/mods/${mod_id}/files/${file_id}")" || return 1
+	parent="$(run_python_on_json "$body" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1])).get("data") or {}
+parent = data.get("parentProjectFileId")
+if isinstance(parent, int) and parent > 0:
+    print(parent)
+PY
+)" || return 1
+	if [[ -z "$parent" ]]; then
+		body="$(cf_api_get "$key" "${CF_API}/mods/${mod_id}/files?pageSize=50")" || return 1
+		parent="$(FILE_ID="$file_id" run_python_on_json "$body" <<'PY'
+import json, os, sys
+want = int(os.environ["FILE_ID"])
+for f in json.load(open(sys.argv[1])).get("data") or []:
+    if f.get("serverPackFileId") == want:
+        print(f["id"])
+        break
+PY
+)" || return 1
+	fi
+	if [[ ! "$parent" =~ ^[0-9]+$ ]]; then
+		echo "Error: could not find the client pack for this server pack." >&2
+		return 1
+	fi
+	url="$(cf_download_url "$key" "$mod_id" "$parent")" || return 1
+	zip="${work}/client.zip"
+	echo "Reading the mod loader version from the client pack..." >&2
+	if ! curl -fL --proto =https --retry 2 -A modman -o "$zip" -# "$url"; then
+		echo "Error: client pack download failed." >&2
+		return 1
+	fi
+	python3 - "$zip" <<'PY'
+import json, re, sys, zipfile
+try:
+    with zipfile.ZipFile(sys.argv[1]) as zf:
+        manifest = json.load(zf.open("manifest.json"))
+except Exception:
+    sys.stderr.write("Error: client pack has no readable manifest.json\n")
+    sys.exit(1)
+mc = (manifest.get("minecraft") or {})
+version = mc.get("version") or ""
+loaders = mc.get("modLoaders") or []
+loaders.sort(key=lambda item: 0 if item.get("primary") else 1)
+loader = loaders[0].get("id", "") if loaders else ""
+match = re.fullmatch(r"(forge|neoforge|fabric|quilt)-([0-9A-Za-z.+_-]+)", loader)
+if not match or not re.fullmatch(r"[0-9][0-9A-Za-z.+_-]*", version):
+    sys.stderr.write(f"Error: client pack names an unknown mod loader '{loader}'\n")
+    sys.exit(1)
+print(f"{match.group(1)}\t{match.group(2)}\t{version}")
+PY
+}
+
+# Download a mod loader into a server pack that shipped without one.
+cf_fetch_loader() {
+	local root="$1"
+	local loader="$2"
+	local version="$3"
+	local mc="$4"
+	local url out installer
+	case "$loader" in
+	forge)
+		url="https://maven.minecraftforge.net/net/minecraftforge/forge/${mc}-${version}/forge-${mc}-${version}-installer.jar"
+		out="forge-${mc}-${version}-installer.jar"
+		;;
+	neoforge)
+		url="https://maven.neoforged.net/releases/net/neoforged/neoforge/${version}/neoforge-${version}-installer.jar"
+		out="neoforge-${version}-installer.jar"
+		;;
+	fabric)
+		installer="$(curl -fsS --proto =https --retry 2 -A modman "https://meta.fabricmc.net/v2/versions/installer" | python3 -c '
+import json, sys
+for item in json.load(sys.stdin):
+    if item.get("stable"):
+        print(item["version"])
+        break
+')" || installer=""
+		if [[ ! "$installer" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]]; then
+			echo "Error: could not look up the Fabric installer version." >&2
+			return 1
+		fi
+		url="https://meta.fabricmc.net/v2/versions/loader/${mc}/${version}/${installer}/server/jar"
+		out="fabric-server-launch.jar"
+		;;
+	*)
+		echo "Error: the server pack ships no launcher, and modman cannot install ${loader} ${version}." >&2
+		return 1
+		;;
+	esac
+	echo "The server pack ships no launcher. Downloading ${loader} ${version} for Minecraft ${mc}..." >&2
+	if ! curl -fL --proto =https --retry 2 -A modman -o "${root}/${out}" -# "$url"; then
+		rm -f "${root}/${out}"
+		echo "Error: ${loader} download failed." >&2
+		return 1
+	fi
+}
+
+# Java 8 binary for Minecraft before 1.17, which Forge and Fabric of that era need.
+# Prints nothing to use the default java.
+cf_java_for_mc() {
+	local mc="$1"
+	local minor bin
+	minor="${mc#1.}"
+	minor="${minor%%.*}"
+	if [[ ! "$minor" =~ ^[0-9]+$ ]] || ((minor >= 17)); then
+		return 0
+	fi
+	for bin in /usr/lib/jvm/*-8-*/bin/java /usr/lib/jvm/*-1.8.0*/bin/java /usr/lib/jvm/*-1.8.0*/jre/bin/java /usr/lib/jvm/*jdk8*/bin/java; do
+		if [[ -x "$bin" ]]; then
+			printf '%s' "$bin"
+			return 0
+		fi
+	done
+	echo "Warning: Minecraft ${mc} needs Java 8, and none was found in /usr/lib/jvm. The server will not start until Java 8 is installed and start.sh points at it." >&2
 }
 
 # Ask for a search string. Prints the trimmed query on stdout.
@@ -1814,7 +2060,8 @@ cf_stage_server_pack() {
 	local key="$1"
 	local mod_id="$2"
 	local file_id="$3"
-	local url work zip root generated="-"
+	local url work zip root generated="-" status=0
+	local loader loader_name loader_version mc_version java
 
 	url="$(cf_download_url "$key" "$mod_id" "$file_id")" || return 1
 	work="$(mktemp -d)"
@@ -1830,8 +2077,26 @@ cf_stage_server_pack() {
 		return 1
 	fi
 	if [[ ! -f "$root/start.sh" ]]; then
-		if ! generated="$(cf_write_start_sh "$root")"; then
+		generated="$(cf_write_start_sh "$root")" || status=$?
+		if ((status == 2)); then
+			# Some packs (RLCraft, for one) ship only mods and configs. Get the
+			# loader the client pack names.
+			status=0
+			if ! loader="$(cf_client_loader "$key" "$mod_id" "$file_id" "$work")" ||
+				! IFS=$'\t' read -r loader_name loader_version mc_version <<<"$loader" ||
+				! cf_fetch_loader "$root" "$loader_name" "$loader_version" "$mc_version"; then
+				rm -rf "$work"
+				echo "Error: server pack has no start.sh, run script, or server jar" >&2
+				return 1
+			fi
+			java="$(cf_java_for_mc "$mc_version")"
+			generated="$(cf_write_start_sh "$root" "$java")" || status=$?
+		fi
+		if ((status != 0)); then
 			rm -rf "$work"
+			if ((status == 2)); then
+				echo "Error: server pack has no start.sh, run script, or server jar" >&2
+			fi
 			return 1
 		fi
 	fi
@@ -2135,7 +2400,7 @@ update_modpack() {
 	echo "Looking up the server pack for ${mod_name}..."
 	file_id="$(cf_server_pack_file "$key" "$mod_id")" || return 1
 	if [[ -n "$known_file" && "$known_file" == "$file_id" ]]; then
-		echo "'${name}' is already on server pack file ${file_id}."
+		echo "'${name}' is already on the latest version."
 		return 0
 	fi
 	meta="$(cf_file_meta "$key" "$mod_id" "$file_id")" || return 1
@@ -2290,21 +2555,91 @@ web_service_activity() {
 	fi
 }
 
+# Java major version each pack needs, from its Minecraft version.
+# Prints "name<TAB>major" per pack, with "-" when the version is unknown.
+packs_required_java() {
+	python3 - "$MINECRAFT_ROOT" "$@" <<'PY'
+import json, os, re, sys, zipfile
+root = sys.argv[1]
+MC = re.compile(r"(?<![0-9])(1\.[0-9]{1,2}(?:\.[0-9]{1,2})?)(?![0-9])")
+
+def java_for(version):
+    parts = [int(p) for p in version.split(".")]
+    if parts[0] >= 2:
+        # Year-based versions (26.1 and later) need Java 25.
+        return 25
+    minor = parts[1] if len(parts) > 1 else 0
+    patch = parts[2] if len(parts) > 2 else 0
+    if minor < 17:
+        return 8
+    if minor == 17:
+        return 16
+    if minor < 20 or (minor == 20 and patch < 5):
+        return 17
+    return 21
+
+def from_server_jar(path):
+    try:
+        with zipfile.ZipFile(path) as zf:
+            data = json.load(zf.open("version.json"))
+    except Exception:
+        return None
+    need = data.get("java_version")
+    return need if isinstance(need, int) else None
+
+def required(pack):
+    jar = os.path.join(pack, "server.jar")
+    if os.path.isfile(jar):
+        need = from_server_jar(jar)
+        if need:
+            return need
+    libs = os.path.join(pack, "libraries", "net", "minecraft", "server")
+    if os.path.isdir(libs):
+        for name in sorted(os.listdir(libs)):
+            if re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", name):
+                return java_for(name)
+    variables = os.path.join(pack, "variables.txt")
+    if os.path.isfile(variables):
+        with open(variables, errors="replace") as fh:
+            for line in fh:
+                match = re.match(r"\s*MINECRAFT_VERSION\s*=\s*[\"']?([0-9]+\.[0-9]+(?:\.[0-9]+)?)", line)
+                if match:
+                    return java_for(match.group(1))
+    try:
+        names = sorted(os.listdir(pack))
+    except OSError:
+        return None
+    for name in names:
+        if name.lower().endswith(".jar"):
+            match = MC.search(name)
+            if match:
+                return java_for(match.group(1))
+    return None
+
+for name in sys.argv[2:]:
+    need = required(os.path.join(root, name))
+    print(f"{name}\t{need or '-'}")
+PY
+}
+
 web_pack_row() {
 	local file="$1"
 	local indexed="$2"
 	local name="$3"
+	local need="${4:--}"
+	local usage="${5:-}"
 	local java port status cpu ram uptime curse=0
 
 	java="$(get_java_version "$name")"
 	port="$(get_port "$name")"
 	if [[ -d "$MINECRAFT_ROOT/$name" ]]; then
 		status="$(display_status "$name")"
-		{
-			read -r cpu
-			read -r ram
-			read -r uptime
-		} < <(pack_usage_cells "$name")
+		cpu="-"
+		ram="-"
+		uptime="-"
+		if [[ "$status" != "stopped" && -n "$usage" ]] && pack_stays_inside "$name"; then
+			IFS=$'\t' read -r cpu ram uptime <<<"$usage"
+		fi
 		if [[ -f "$MINECRAFT_ROOT/$name/.curseforge-id" ]]; then
 			curse=1
 		fi
@@ -2314,25 +2649,34 @@ web_pack_row() {
 		ram="-"
 		uptime="-"
 	fi
-	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
-		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" >>"$file"
+	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" "$need" >>"$file"
 }
 
 web_json_packs() {
-	local file name active enabled
-	local -A seen=()
+	local file name active enabled major
+	local -A seen=() needs=() usage=()
+	local -a others=()
 	file="$(mktemp)"
+	collect_pack_usage usage
 	read_index
-	for name in "${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}"; do
-		[[ -n "$name" ]] || continue
-		web_pack_row "$file" 1 "$name"
-		seen["$name"]=1
-	done
 	while IFS= read -r name; do
 		[[ -n "$name" ]] || continue
 		[[ -n "${seen[$name]:-}" ]] && continue
-		web_pack_row "$file" 0 "$name"
+		others+=("$name")
 	done < <(all_modpack_names || true)
+	while IFS=$'\t' read -r name major; do
+		[[ -n "$name" ]] && needs["$name"]="$major"
+	done < <(packs_required_java "${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}" "${others[@]+"${others[@]}"}" 2>/dev/null || true)
+	for name in "${INDEX_ENTRIES[@]+"${INDEX_ENTRIES[@]}"}"; do
+		[[ -n "$name" ]] || continue
+		web_pack_row "$file" 1 "$name" "${needs[$name]:--}" "${usage[$name]:-}"
+		seen["$name"]=1
+	done
+	for name in "${others[@]+"${others[@]}"}"; do
+		[[ -n "${seen[$name]:-}" ]] && continue
+		web_pack_row "$file" 0 "$name" "${needs[$name]:--}" "${usage[$name]:-}"
+	done
 	active="$(web_service_activity)"
 	enabled="$(systemctl is-enabled "$SYSTEMD_SERVICE" 2>/dev/null || true)"
 	[[ -n "$active" ]] || active="unknown"
@@ -2344,9 +2688,9 @@ rows = []
 with open(sys.argv[1], encoding="utf-8") as fh:
     for line in fh:
         parts = line.rstrip("\n").split("\x1f")
-        if len(parts) != 9:
+        if len(parts) != 10:
             continue
-        indexed, name, java, port, status, cpu, ram, uptime, curse = parts
+        indexed, name, java, port, status, cpu, ram, uptime, curse, need = parts
         rows.append({
             "indexed": indexed == "1",
             "name": name,
@@ -2357,6 +2701,7 @@ with open(sys.argv[1], encoding="utf-8") as fh:
             "ram": ram,
             "uptime": uptime,
             "curseforge": curse == "1",
+            "java_need": need,
         })
 print(json.dumps({
     "packs": rows,
@@ -2549,6 +2894,9 @@ web_run() {
 		if [[ -n "${1:-}" ]] && ! valid_modpack_name "$1"; then
 			echo "Error: '$1' is not a modpack name." >&2
 			return 1
+		fi
+		if [[ "${2:-}" == "agree" && -n "${1:-}" ]]; then
+			MODMAN_EULA=agree
 		fi
 		case "$cmd" in
 		start) start_servers "${1:-}" ;;

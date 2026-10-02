@@ -336,6 +336,9 @@ APP_PAGE = r"""<!DOCTYPE html>
   .starting { color: #8a5a00; }
   .running { color: #1d7a3a; }
   .error { color: #9a3412; }
+  .java-warn { color: #9a3412; font-weight: 600; }
+  .port-warn { color: #9a3412; font-size: 0.8rem; margin-top: 0.25rem; max-width: 12rem; }
+  .port-warn:empty { display: none; }
   .actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
   .actions input[type="number"] { width: 5.5rem; font: inherit; padding: 0.2rem; }
   tr.busy { color: #8a8478; }
@@ -355,6 +358,15 @@ APP_PAGE = r"""<!DOCTYPE html>
   .console-form[hidden] { display: none; }
   .console-form select, .console-form input { font: inherit; padding: 0.3rem; }
   .console-form input { flex: 1; min-width: 12rem; }
+  .pick { position: relative; }
+  .pick-btn { font: inherit; background: #fff; color: #1c1c1c; border: 1px solid #c8c2b4; padding: 0.3rem 0.55rem; cursor: pointer; min-width: 10rem; text-align: left; }
+  .pick-btn::after { content: " \25BE"; float: right; margin-left: 0.6rem; }
+  .pick-btn:disabled { opacity: 0.6; cursor: default; }
+  .pick-menu { position: absolute; left: 0; top: calc(100% + 0.2rem); z-index: 6; min-width: 100%; max-height: 16rem; overflow-y: auto; background: #fff; border: 1px solid #c8c2b4; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); display: flex; flex-direction: column; }
+  .pick-menu[hidden] { display: none; }
+  .pick-menu button { font: inherit; text-align: left; background: #fff; color: #1c1c1c; border: 0; padding: 0.35rem 0.6rem; cursor: pointer; white-space: nowrap; }
+  .pick-menu button:hover, .pick-menu button:focus { background: #ece7dc; outline: none; }
+  .pick-menu button[aria-selected="true"] { font-weight: 600; }
   #out { white-space: pre-wrap; background: #1c1c1c; color: #f3f0e8; padding: 0.8rem; min-height: 2.5rem; max-height: 24rem; overflow: auto; }
   dialog { border: 1px solid #ccc; padding: 1rem; max-width: 28rem; }
   dialog label { display: block; margin: 0.5rem 0; }
@@ -405,9 +417,13 @@ APP_PAGE = r"""<!DOCTYPE html>
     <span id="console-spin" class="spinner" hidden role="status" aria-label="Loading"></span>
   </div>
   <form id="console-form" class="console-form">
-    <select id="console-pack" aria-label="Modpack">
-      <option value="">Actions</option>
-    </select>
+    <div class="pick">
+      <select id="console-pack" aria-label="Modpack" hidden>
+        <option value="">Actions</option>
+      </select>
+      <button type="button" id="console-pick-btn" class="pick-btn" aria-haspopup="listbox" aria-expanded="false">Actions</button>
+      <div id="console-pick-menu" class="pick-menu" role="listbox" aria-label="Modpack" hidden></div>
+    </div>
     <input id="console-cmd" type="text" maxlength="300" placeholder="Command" autocomplete="off">
     <button type="submit">Send</button>
   </form>
@@ -436,6 +452,7 @@ const dlg = document.getElementById("dlg");
 let hold = false;
 let rowBusy = false;
 let packsBusy = false;
+let packsTicket = 0;
 let logBusy = false;
 let packs = [];
 let searchAbort = null;
@@ -474,6 +491,7 @@ function show(text) {
   consoleOffset = 0;
   const sel = document.getElementById("console-pack");
   if ([...sel.options].some((opt) => opt.value === "")) sel.value = "";
+  syncPick();
   out.textContent = actionText;
   if (!consoleBusy) {
     document.getElementById("console-cmd").disabled = true;
@@ -503,18 +521,34 @@ async function finishServer(name, label, request) {
     const data = await request();
     if (!data) return;
     show(data.output || (data.ok ? "Done." : "Failed."));
+    return data;
   } catch {
     show("The page could not reach the server.");
   } finally {
+    // Keep the row busy until the list shows the result of the action.
+    hold = false;
+    await loadPacks(true);
     if (name) setServerBusy(name, false);
     else rowBusy = false;
-    hold = false;
-    loadPacks();
   }
 }
 
 async function run(payload, label) {
-  await finishServer(payload.name || "", label, () => api("/api/run", payload));
+  const data = await finishServer(payload.name || "", label, () => api("/api/run", payload));
+  if (data && data.eula && payload.name) askEula(payload, label);
+}
+
+function askEula(payload, label) {
+  const url = "https://aka.ms/MinecraftEULA";
+  ask(`<form>
+    <p><strong>${esc(payload.name)}</strong> needs the Minecraft End User License Agreement (EULA) accepted before it can start.</p>
+    <p>Read the full terms: <a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a></p>
+    <p>By choosing I agree, you are indicating your agreement to the Minecraft EULA, and <code>eula=true</code> is written to the server's <code>eula.txt</code>.</p>
+    <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">I agree</button></div>
+  </form>`, () => {
+    dlg.close();
+    run({...payload, eula: "agree"}, label);
+  });
 }
 
 function ask(html, onok) {
@@ -558,6 +592,32 @@ document.addEventListener("click", (ev) => {
   menu.open = false;
 });
 
+// Java the pack needs is a minimum, except before Minecraft 1.17, which needs Java 8 exactly.
+function javaWarning(pack) {
+  const have = Number(pack.java);
+  const need = Number(pack.java_need);
+  if (!Number.isFinite(have) || !Number.isFinite(need)) return "";
+  if (need === 8 ? have !== 8 : have < need) return `This pack needs Java ${need}, but start.sh runs Java ${have}`;
+  return "";
+}
+
+function javaText(pack) {
+  return javaWarning(pack) ? `${pack.java} (needs ${pack.java_need})` : pack.java;
+}
+
+// A server is active when it is up, or enabled so it starts with the others.
+function isActive(pack) {
+  return pack.indexed || (pack.status && pack.status !== "stopped");
+}
+
+function portWarning(pack) {
+  if (!pack.port || pack.port === "-" || !isActive(pack)) return "";
+  const others = packs.filter((p) => p.name !== pack.name && p.port === pack.port && isActive(p));
+  if (!others.length) return "";
+  const names = others.map((p) => `${p.name} (${p.status === "stopped" ? "enabled" : p.status})`);
+  return `Port ${pack.port} is also used by ${names.join(", ")}`;
+}
+
 function row(pack) {
   const port = pack.port === "-" ? "" : pack.port;
   const indexBtn = pack.indexed
@@ -570,8 +630,9 @@ function row(pack) {
     : "";
   return `<tr data-name="${esc(pack.name)}">
     <td>${esc(pack.name)}</td>
-    <td>${esc(pack.java)}</td>
-    <td><input type="number" min="1" max="65535" value="${esc(port)}" data-port> <button type="button" data-act="port">Set</button></td>
+    <td class="${javaWarning(pack) ? "java-warn" : ""}" title="${esc(javaWarning(pack))}">${esc(javaText(pack))}</td>
+    <td><input type="number" min="1" max="65535" value="${esc(port)}" data-port> <button type="button" data-act="port">Set</button>
+      <div class="port-warn" data-port-warn>${esc(portWarning(pack))}</div></td>
     <td class="status ${esc(pack.status)}">${esc(pack.status)}</td>
     <td>${esc(pack.cpu)}</td>
     <td>${esc(pack.ram)}</td>
@@ -579,6 +640,7 @@ function row(pack) {
     <td class="actions">
       ${runBtns}
       ${indexBtn}
+      <button type="button" data-act="log">Log</button>
       <button type="button" data-act="update">Update</button>
       <button type="button" class="danger" data-act="uninstall">Uninstall</button>
       <span class="loadbar" hidden role="progressbar" aria-label="Working"><span></span></span>
@@ -642,13 +704,12 @@ function restoreState() {
   consoleOffset = Number.isFinite(saved.consoleOffset) && saved.consoleOffset >= 0 ? saved.consoleOffset : 0;
   consoleName = saved.consoleName == null ? null : String(saved.consoleName);
   if (!document.querySelector("#packs tr")) render();
-  const sel = document.getElementById("console-pack");
-  const names = runningPacks().map((p) => p.name);
-  sel.innerHTML = `<option value="">Actions</option>` + names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
-  const follow = !!(consoleName && names.includes(consoleName));
-  sel.value = follow ? consoleName : "";
-  document.getElementById("console-cmd").disabled = !follow;
-  document.querySelector("#console-form button[type=submit]").disabled = !follow;
+  const list = runningPacks();
+  fillPicker(list);
+  const follow = !!(consoleName && list.some((p) => p.name === consoleName));
+  document.getElementById("console-pack").value = follow ? consoleName : "";
+  syncPick();
+  setCommandEnabled(follow);
   const svc = saved.service || {};
   if (typeof svc.active === "string") paintDot("svc-dot", svc.active === "active", svc.active);
   if (typeof svc.enabled === "string") paintDot("boot-dot", svc.enabled === "enabled", svc.enabled);
@@ -667,11 +728,18 @@ function updateVisibleStatus() {
     if (!statusCell || cells.length < 7) continue;
     statusCell.className = `status ${pack.status}`;
     statusCell.textContent = pack.status;
-    cells[1].textContent = pack.java;
+    cells[1].textContent = javaText(pack);
+    cells[1].className = javaWarning(pack) ? "java-warn" : "";
+    cells[1].title = javaWarning(pack);
     const portInput = tr.querySelector("[data-port]");
     if (portInput && document.activeElement !== portInput) {
       const next = pack.port === "-" ? "" : String(pack.port);
       if (portInput.value !== next) portInput.value = next;
+    }
+    const warn = tr.querySelector("[data-port-warn]");
+    if (warn) {
+      const text = portWarning(pack);
+      if (warn.textContent !== text) warn.textContent = text;
     }
     cells[4].textContent = pack.cpu;
     cells[5].textContent = pack.ram;
@@ -689,8 +757,9 @@ function syncPacks() {
   else updateVisibleStatus();
 }
 
+// Servers the console can follow: up and booting, or up and done booting.
 function runningPacks() {
-  return packs.filter((p) => p.status === "running");
+  return packs.filter((p) => p.status === "running" || p.status === "starting");
 }
 
 function setConsoleBusy(on) {
@@ -699,31 +768,139 @@ function setConsoleBusy(on) {
   for (const el of document.querySelectorAll("#console-form select, #console-form input, #console-form button")) {
     el.disabled = on;
   }
+  if (on) closePick();
+}
+
+// The console picker is drawn by the page. The hidden <select> holds the value
+// and options. A native dropdown popup can show as a blank white box when its
+// options change or it is disabled while open, so it is not used.
+const pickBtn = document.getElementById("console-pick-btn");
+const pickMenu = document.getElementById("console-pick-menu");
+
+function pickOpen() {
+  return !pickMenu.hidden;
+}
+
+function fillPickMenu() {
+  const sel = document.getElementById("console-pack");
+  const focused = document.activeElement && pickMenu.contains(document.activeElement)
+    ? document.activeElement.dataset.value : null;
+  pickMenu.replaceChildren(...[...sel.options].map((opt) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "option");
+    b.dataset.value = opt.value;
+    b.textContent = opt.textContent;
+    b.setAttribute("aria-selected", String(opt.value === sel.value));
+    return b;
+  }));
+  if (focused != null) {
+    const again = [...pickMenu.children].find((b) => b.dataset.value === focused);
+    if (again) again.focus();
+  }
+}
+
+// Show the selected option on the button, and refresh the menu if it is open.
+function syncPick() {
+  const sel = document.getElementById("console-pack");
+  const opt = sel.options[sel.selectedIndex];
+  const label = opt ? opt.textContent : "Actions";
+  if (pickBtn.textContent !== label) pickBtn.textContent = label;
+  if (pickOpen()) fillPickMenu();
+}
+
+function openPick() {
+  if (pickBtn.disabled) return;
+  fillPickMenu();
+  pickMenu.hidden = false;
+  pickBtn.setAttribute("aria-expanded", "true");
+  const current = pickMenu.querySelector('[aria-selected="true"]') || pickMenu.firstElementChild;
+  if (current) current.focus();
+}
+
+function closePick(refocus) {
+  if (!pickOpen()) return;
+  pickMenu.hidden = true;
+  pickBtn.setAttribute("aria-expanded", "false");
+  if (refocus) pickBtn.focus();
+}
+
+pickBtn.onclick = () => (pickOpen() ? closePick(true) : openPick());
+
+pickMenu.onclick = (ev) => {
+  const b = ev.target.closest("button");
+  if (!b) return;
+  const sel = document.getElementById("console-pack");
+  closePick(true);
+  if (b.dataset.value === sel.value) return;
+  sel.value = b.dataset.value;
+  syncPick();
+  sel.dispatchEvent(new Event("change"));
+};
+
+pickMenu.onkeydown = (ev) => {
+  const items = [...pickMenu.children];
+  const i = items.indexOf(document.activeElement);
+  if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    ev.preventDefault();
+    const next = items[(i + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
+    if (next) next.focus();
+  } else if (ev.key === "Escape") {
+    ev.preventDefault();
+    closePick(true);
+  } else if (ev.key === "Tab") {
+    closePick(false);
+  }
+};
+
+document.addEventListener("pointerdown", (ev) => {
+  if (pickOpen() && !ev.target.closest(".pick")) closePick(false);
+});
+
+function consoleLabel(pack) {
+  return pack.status === "starting" ? `${pack.name} (starting)` : pack.name;
+}
+
+// Update the options in place, only when the names or labels changed.
+function fillPicker(list) {
+  const sel = document.getElementById("console-pack");
+  const wanted = [["", "Actions"], ...list.map((p) => [p.name, consoleLabel(p)])];
+  const same = wanted.length === sel.options.length &&
+    wanted.every(([value, label], i) => sel.options[i].value === value && sel.options[i].textContent === label);
+  if (!same) {
+    const value = sel.value;
+    sel.replaceChildren(...wanted.map(([v, label]) => new Option(label, v)));
+    sel.value = wanted.some(([v]) => v === value) ? value : "";
+  }
+  syncPick();
+}
+
+function setCommandEnabled(on) {
+  if (consoleBusy) return;
+  document.getElementById("console-cmd").disabled = !on;
+  document.querySelector("#console-form button[type=submit]").disabled = !on;
 }
 
 function fillConsolePacks() {
   if (consoleBusy) return;
-  const sel = document.getElementById("console-pack");
-  if (document.activeElement === sel) return;
-  const names = runningPacks().map((p) => p.name);
-  const wanted = ["", ...names];
-  const same = wanted.length === sel.options.length && wanted.every((name, i) => sel.options[i].value === name);
-  if (!same) {
-    sel.innerHTML = `<option value="">Actions</option>` + names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
-  }
-  if (consoleName == null) consoleName = names[0] || "";
-  else if (consoleName && !names.includes(consoleName)) {
+  const list = runningPacks();
+  const names = list.map((p) => p.name);
+  fillPicker(list);
+  if (consoleName == null) {
     consoleName = names[0] || "";
     consoleOffset = 0;
+  } else if (consoleName && !names.includes(consoleName)) {
+    // The server went down. Keep its last output on screen, such as a crash,
+    // rather than jumping to another server's log.
+    document.getElementById("console-msg").textContent = `${consoleName} is no longer running.`;
+    actionText = out.textContent;
+    consoleName = "";
+    consoleOffset = 0;
   }
-  sel.value = consoleName;
-  if (!consoleName) {
-    out.textContent = actionText;
-    if (!consoleBusy) {
-      document.getElementById("console-cmd").disabled = true;
-      document.querySelector("#console-form button[type=submit]").disabled = true;
-    }
-  }
+  document.getElementById("console-pack").value = consoleName;
+  syncPick();
+  setCommandEnabled(!!consoleName);
+  if (!consoleName) out.textContent = actionText;
 }
 
 function trimConsole(text) {
@@ -779,6 +956,7 @@ async function followConsole(name) {
   consoleName = name;
   const sel = document.getElementById("console-pack");
   if ([...sel.options].some((opt) => opt.value === name)) sel.value = name;
+  syncPick();
   document.getElementById("console-msg").textContent = "";
   setConsoleBusy(true);
   try {
@@ -831,17 +1009,21 @@ document.getElementById("console-form").onsubmit = async (ev) => {
   setTimeout(refreshConsole, 500);
 };
 
-async function loadPacks() {
-  if (hold || rowBusy || dlg.open || packsBusy) return;
+// After an action, force skips the busy checks and replaces any poll still in
+// flight, whose list may predate the action.
+async function loadPacks(force) {
+  if (!force && (hold || rowBusy || dlg.open || packsBusy)) return;
   packsBusy = true;
+  const ticket = ++packsTicket;
   let data;
   try {
     data = await api("/api/packs");
   } catch (err) {
-    packsBusy = false;
+    if (ticket === packsTicket) packsBusy = false;
     return;
   }
-  if (hold || rowBusy || dlg.open) {
+  if (ticket !== packsTicket) return;
+  if (!force && (hold || rowBusy || dlg.open)) {
     packsBusy = false;
     return;
   }
@@ -873,6 +1055,23 @@ document.getElementById("packs").onclick = async (ev) => {
   if (act === "port") {
     const port = tr.querySelector("[data-port]").value;
     run({cmd: "port", name, port}, `Setting ${name} port to ${port}…`);
+    return;
+  }
+  if (act === "log") {
+    // A running server streams into the console. A stopped one shows its last log once.
+    if (runningPacks().some((p) => p.name === name)) {
+      followConsole(name);
+      return;
+    }
+    hold = true;
+    show(`Reading ${name} log…`);
+    try {
+      const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=0");
+      if (data) show(data.ok === false ? (data.output || "Could not read the log.") : `${name} is not running. Last log:\n\n${data.output || "(empty)"}`);
+    } catch {
+      show("The page could not reach the server.");
+    } finally { hold = false; }
+    out.scrollTop = out.scrollHeight;
     return;
   }
   if (act === "uninstall") {
@@ -991,7 +1190,7 @@ document.getElementById("search-form").onsubmit = async (ev) => {
         show(`Installing ${item.name}…`);
         api("/api/install", {id: String(item.id)}).then((res) => {
           if (res) show(res.output || (res.ok ? "Done." : "Failed."));
-        }).finally(() => { hold = false; loadPacks(); });
+        }).finally(() => { hold = false; loadPacks(true); });
       };
       list.appendChild(b);
     });
@@ -1307,6 +1506,8 @@ class Handler(BaseHTTPRequestHandler):
         if cmd in {"start", "stop", "restart", "enable", "disable"}:
             if name:
                 args.append(name)
+                if cmd in {"start", "restart"} and body.get("eula") == "agree":
+                    args.append("agree")
         elif cmd == "port":
             args.extend([name, str(body.get("port") or "")])
         elif cmd == "uninstall":
@@ -1316,7 +1517,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json(400, {"ok": False, "output": "Unknown action."})
             return
-        self.finish_call(args, 180)
+        self.finish_call(args, 180, eula=cmd in {"start", "restart"} and bool(name))
 
     def handle_search(self, body):
         query = str(body.get("query") or "")
@@ -1348,16 +1549,20 @@ class Handler(BaseHTTPRequestHandler):
             str(body.get("mod_id") or ""),
         ], 3600)
 
-    def finish_call(self, args, timeout):
+    def finish_call(self, args, timeout, eula=False):
         try:
             proc = modman_call(args, timeout)
         except subprocess.TimeoutExpired:
             self.send_json(504, {"ok": False, "output": "Timed out."})
             return
-        self.send_json(200 if proc.returncode == 0 else 400, {
+        reply = {
             "ok": proc.returncode == 0,
             "output": command_text(proc),
-        })
+        }
+        # Exit status 3 from start or restart means the Minecraft EULA is not accepted yet.
+        if eula and proc.returncode == 3:
+            reply["eula"] = True
+        self.send_json(200 if proc.returncode == 0 else 400, reply)
 
 
 class HTTPHandler(Handler):
