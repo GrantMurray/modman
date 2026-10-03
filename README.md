@@ -140,11 +140,11 @@ Each modpack is a folder under `/srv/minecraft`. The folder name is the name you
 
 `server.properties` holds the port on a `server-port=` line. `list` and `status` show that port, and the `port` command writes it. When the file or the line is missing, the port column shows `-`.
 
-`edit MyPack` lists every value in `server.properties` with a number. Type a number or a property name, then the new value. Settings that are true or false only take true or false, and whole-number settings only take whole numbers. Only existing settings can be changed, and the file is only there after the server has started once. A running server picks up the change after a restart. On the webpage, each server's **Properties** menu does the same.
+`edit MyPack` lists every value in `server.properties` with a number. Type a number or a property name, then the new value. Settings that are true or false only take true or false, and whole-number settings only take whole numbers. Only existing settings can be changed, and the file is only there after the server has started once. A running server picks up the change after a restart. On the webpage, **Properties…** in each server's **⋯** menu does the same.
 
 When `start.sh` does not name a `java` program, modman reads `JAVA=` from `variables.txt` and uses that path for the Java version column.
 
-The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting**, **running**, and **error** apart.
+The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting**, **running**, and **error** apart. Right after a start, the log left from the last run is ignored until the new server writes to it, so a server shows **starting** rather than **running** while it loads.
 
 `data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. `enable` and `disable` edit this file for you.
 
@@ -198,7 +198,7 @@ If two servers use the same port, their names show up highlighted. They will not
 | `restart MyPack` | Stops and starts that server |
 | `join MyPack` | Opens that server's live console |
 
-`start MyPack`, `stop MyPack`, and `restart MyPack` work for a server that is not enabled. That is there so you can try one without putting it in the boot list. The control page shows those buttons only for an enabled server.
+`start MyPack`, `stop MyPack`, and `restart MyPack` work for a server that is not enabled. That is there so you can try one without putting it in the boot list. The control page offers them only for an enabled server.
 
 Leave the console with **Ctrl-A**, then **d**. That detaches and returns you to the `modman>` prompt. The server keeps running.
 
@@ -218,7 +218,17 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 ## The control page
 
-`web start` starts the page with the saved password. https is on port 8787. http on port 8788 only hands out the certificate, answers Let's Encrypt, and sends everything else to https. The page lists every modpack. Enabled servers have start, stop, and restart. A server that is only installed does not, so a one-off test of that server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running. Every server has enable or disable, the port, a Properties menu for `server.properties`, update, and uninstall. The console list has Actions plus each running server, and a server console keeps updating. Actions shows button results, such as stopping a modpack. The command box sends one line to the selected server.
+`web start` starts the page with the saved password. https is on port 8787. http on port 8788 only hands out the certificate, answers Let's Encrypt, and sends everything else to https.
+
+The page lists every modpack in two groups. **Active** holds the enabled servers, with their status, CPU, memory, and uptime. **Installed** holds the rest. Click the Installed heading to fold that list away. It starts folded on a phone, and the page remembers your choice in that browser.
+
+Each server has one main button for what you most likely want next: **Start** for a stopped server, **Stop** for a running one, **Restart** for one that hit an error, and **Enable** for an installed one. Beside it, **Log** shows that server's console, and **⋯** opens the rest: Restart, Properties… for `server.properties`, Change port…, Update…, Disable, and Uninstall…. Start, stop, and restart are only offered for enabled servers, so a one-off test of an installed server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running.
+
+The result of an action, such as stopping a modpack, shows as a note in the bottom corner. A note for an action that worked fades after a few seconds. An error stays until you close it. **Install modpack** opens a CurseForge search in its own window.
+
+The console list has Actions plus each running server, and a server console keeps updating. Warnings show in yellow and errors in red. The command box sends one line to the selected server, and the Up and Down arrow keys bring back commands sent before from that browser. If you scroll up to read, new lines do not pull you back down; **↓ Latest** jumps to the end. Pressing **Log** on a stopped server shows the last log it wrote. On a wide screen the console sits beside the server list.
+
+The header shows whether the boot service is running and whether it starts at boot. The **Service** menu controls it. **Menu** has **Unlock page**, which cancels anything the page is waiting on and turns greyed-out buttons back on, and **Sign out**. The page follows the light or dark setting of your device.
 
 Update still asks whether to keep or delete the world. Choosing delete asks you to type yes.
 
@@ -266,7 +276,7 @@ Use `web install` and `web enable` when the page should start again after a rebo
 
 `install` and `update` need a CurseForge API key in `data/curseforge-api-key` (see [step 4](#4-add-a-curseforge-api-key-optional)). That file stays on the computer where modman runs.
 
-`install` asks for a modpack name, searches CurseForge, and lists the matches. Press Enter to leave the name prompt or the list. Type the number of the one you want. On the page, Clear beside Search drops the results.
+`install` asks for a modpack name, searches CurseForge, and lists the matches. Press Enter to leave the name prompt or the list. Type the number of the one you want. On the page, **Install modpack** opens the search, and clicking a result asks before it installs.
 
 modman downloads that project's server pack and unpacks it under `/srv/minecraft`. The folder name is the modpack name with spaces removed. The new pack is left out of the index. Run `enable` with the folder name when it should start with the others. If the project has no server pack, install stops.
 
