@@ -367,6 +367,12 @@ APP_PAGE = r"""<!DOCTYPE html>
   .pick-menu button { font: inherit; text-align: left; background: #fff; color: #1c1c1c; border: 0; padding: 0.35rem 0.6rem; cursor: pointer; white-space: nowrap; }
   .pick-menu button:hover, .pick-menu button:focus { background: #ece7dc; outline: none; }
   .pick-menu button[aria-selected="true"] { font-weight: 600; }
+  .props-menu { position: absolute; top: 0; left: 0; min-width: 16rem; max-width: min(28rem, calc(100vw - 2rem)); }
+  .props-menu input { font: inherit; margin: 0.35rem; padding: 0.25rem 0.4rem; border: 1px solid #c8c2b4; }
+  .props-menu .props-list { overflow-y: auto; max-height: 14rem; display: flex; flex-direction: column; }
+  .props-menu button { display: flex; gap: 0.8rem; justify-content: space-between; }
+  .props-menu .props-val { color: #555; overflow: hidden; text-overflow: ellipsis; max-width: 12rem; }
+  .props-menu p { margin: 0.4rem 0.6rem; }
   #out { white-space: pre-wrap; background: #1c1c1c; color: #f3f0e8; padding: 0.8rem; min-height: 2.5rem; max-height: 24rem; overflow: auto; }
   dialog { border: 1px solid #ccc; padding: 1rem; max-width: 28rem; }
   dialog label { display: block; margin: 0.5rem 0; }
@@ -398,6 +404,7 @@ APP_PAGE = r"""<!DOCTYPE html>
         <button type="button" id="svc-disable">Disable at boot</button>
       </div>
     </details>
+    <button type="button" id="unlock" title="Cancel pending requests and re-enable every greyed-out control">Unlock</button>
     <button type="button" id="logout">Sign out</button>
   </div>
 </header>
@@ -446,6 +453,7 @@ APP_PAGE = r"""<!DOCTYPE html>
   </script>
 </main>
 <dialog id="dlg"></dialog>
+<div id="props-menu" class="pick-menu props-menu" role="menu" aria-label="server.properties" hidden></div>
 <script>
 const out = document.getElementById("out");
 const dlg = document.getElementById("dlg");
@@ -468,21 +476,80 @@ function esc(s) {
   }[c]));
 }
 
+// How long the page waits for each endpoint before giving up, in seconds. Each
+// is the server's own modman timeout plus a margin, so a request is only
+// dropped once the server would have answered. A stalled connection then
+// rejects instead of leaving the page greyed out.
+const API_TIMEOUTS = {
+  "/api/run": 180, "/api/packs": 120, "/api/log": 30, "/api/command": 30,
+  "/api/search": 60, "/api/install": 3600, "/api/update": 3600,
+  "/api/props": 30,
+};
+const API_MARGIN = 15;
+
+class ApiTimeout extends Error {
+  constructor() {
+    super("The server did not answer in time.");
+    this.name = "ApiTimeout";
+  }
+}
+
+// Requests in flight, so clearBusy() can cancel them.
+const pending = new Set();
+
 async function api(path, body, signal) {
-  const opts = {headers: {}, signal};
+  const ctrl = new AbortController();
+  pending.add(ctrl);
+  const secs = (API_TIMEOUTS[path.split("?")[0]] || 30) + API_MARGIN;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, secs * 1000);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onAbort, {once: true});
+  }
+  const opts = {headers: {}, signal: ctrl.signal};
   if (body !== undefined) {
     opts.method = "POST";
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(path, opts);
-  if (res.status === 401) {
-    location.href = "/login";
-    return null;
+  try {
+    const res = await fetch(path, opts);
+    if (res.status === 401) {
+      location.href = "/login";
+      return null;
+    }
+    const text = await res.text();
+    try { return JSON.parse(text); }
+    catch { return {ok: false, output: text}; }
+  } catch (err) {
+    if (timedOut) throw new ApiTimeout();
+    throw err;
+  } finally {
+    pending.delete(ctrl);
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
   }
-  const text = await res.text();
-  try { return JSON.parse(text); }
-  catch { return {ok: false, output: text}; }
+}
+
+// Cancels every request the page is waiting on and re-enables everything a
+// busy state greyed out. The server may still finish an action it already
+// started; the next list poll shows the result.
+function clearBusy() {
+  for (const ctrl of pending) ctrl.abort();
+  pending.clear();
+  if (searchAbort) searchAbort.abort();
+  searchAbort = null;
+  hold = false;
+  packsBusy = false;
+  packsTicket++;
+  logBusy = false;
+  consoleTicket++;
+  closeProps();
+  setServerBusy(null, false);
+  setConsoleBusy(false);
+  setCommandEnabled(!!consoleName && runningPacks().some((p) => p.name === consoleName));
 }
 
 function show(text) {
@@ -517,17 +584,26 @@ async function finishServer(name, label, request) {
   if (name) setServerBusy(name, true);
   else rowBusy = true;
   show(label || "Working…");
+  let reached = false;
   try {
     const data = await request();
+    reached = true;
     if (!data) return;
     show(data.output || (data.ok ? "Done." : "Failed."));
     return data;
-  } catch {
-    show("The page could not reach the server.");
+  } catch (err) {
+    show(err instanceof ApiTimeout
+      ? "The server did not answer in time. Check the server list for the result."
+      : err && err.name === "AbortError"
+        ? "Cancelled. The server may still finish the action; check the server list."
+        : "The page could not reach the server.");
   } finally {
-    // Keep the row busy until the list shows the result of the action.
+    // Keep the row busy until the list shows the result of the action. If the
+    // server could not be reached, release the row now rather than waiting on
+    // a list request that will likely stall the same way.
     hold = false;
-    await loadPacks(true);
+    if (reached) await loadPacks(true);
+    else loadPacks(true);
     if (name) setServerBusy(name, false);
     else rowBusy = false;
   }
@@ -641,6 +717,7 @@ function row(pack) {
       ${runBtns}
       ${indexBtn}
       <button type="button" data-act="log">Log</button>
+      <button type="button" data-act="props" aria-haspopup="menu" title="Edit server.properties">Properties &#9662;</button>
       <button type="button" data-act="update">Update</button>
       <button type="button" class="danger" data-act="uninstall">Uninstall</button>
       <span class="loadbar" hidden role="progressbar" aria-label="Working"><span></span></span>
@@ -703,7 +780,9 @@ function restoreState() {
   actionText = typeof saved.actionText === "string" ? saved.actionText : "";
   consoleOffset = Number.isFinite(saved.consoleOffset) && saved.consoleOffset >= 0 ? saved.consoleOffset : 0;
   consoleName = saved.consoleName == null ? null : String(saved.consoleName);
-  if (!document.querySelector("#packs tr")) render();
+  // Rebuild from the saved list instead of keeping the saved table, which may
+  // come from an older page whose rows lack newer buttons.
+  render();
   const list = runningPacks();
   fillPicker(list);
   const follow = !!(consoleName && list.some((p) => p.name === consoleName));
@@ -1057,6 +1136,11 @@ document.getElementById("packs").onclick = async (ev) => {
     run({cmd: "port", name, port}, `Setting ${name} port to ${port}…`);
     return;
   }
+  if (act === "props") {
+    if (propsMenu.dataset.name === name && !propsMenu.hidden) closeProps(true);
+    else openProps(btn, name);
+    return;
+  }
   if (act === "log") {
     // A running server streams into the console. A stopped one shows its last log once.
     if (runningPacks().some((p) => p.name === name)) {
@@ -1152,6 +1236,145 @@ document.getElementById("packs").onclick = async (ev) => {
   run({cmd: act, name}, `${act} ${name}…`);
 };
 
+// The server.properties menu floats over the page, outside the table, so a
+// table redraw or saved page state never holds a half-open menu.
+const propsMenu = document.getElementById("props-menu");
+let propsTicket = 0;
+let propsAnchor = null;
+
+function placeProps() {
+  if (!propsAnchor || !propsAnchor.isConnected) return;
+  const r = propsAnchor.getBoundingClientRect();
+  const width = propsMenu.offsetWidth;
+  const left = Math.max(8, Math.min(r.left, document.documentElement.clientWidth - width - 8));
+  propsMenu.style.left = (left + window.scrollX) + "px";
+  propsMenu.style.top = (r.bottom + window.scrollY + 3) + "px";
+}
+
+function closeProps(refocus) {
+  propsTicket++;
+  if (propsMenu.hidden) return;
+  propsMenu.hidden = true;
+  propsMenu.dataset.name = "";
+  if (propsAnchor) propsAnchor.setAttribute("aria-expanded", "false");
+  if (refocus && propsAnchor && propsAnchor.isConnected) propsAnchor.focus();
+  propsAnchor = null;
+}
+
+function propsNote(text) {
+  const p = document.createElement("p");
+  p.className = "muted";
+  p.textContent = text;
+  propsMenu.replaceChildren(p);
+  placeProps();
+}
+
+async function openProps(btn, name) {
+  closeProps();
+  const ticket = ++propsTicket;
+  propsAnchor = btn;
+  propsMenu.dataset.name = name;
+  btn.setAttribute("aria-expanded", "true");
+  propsMenu.hidden = false;
+  propsNote("Loading…");
+  let data;
+  try {
+    data = await api("/api/props?name=" + encodeURIComponent(name));
+  } catch (err) {
+    if (ticket === propsTicket) {
+      propsNote(err instanceof ApiTimeout ? err.message : "The page could not reach the server.");
+    }
+    return;
+  }
+  if (ticket !== propsTicket || !data) return;
+  if (!data.ok || !Array.isArray(data.properties)) {
+    propsNote(data.output || "Could not read server.properties.");
+    return;
+  }
+  const filter = document.createElement("input");
+  filter.type = "search";
+  filter.placeholder = "Filter";
+  filter.setAttribute("aria-label", "Filter properties");
+  const list = document.createElement("div");
+  list.className = "props-list";
+  for (const prop of data.properties) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "menuitem");
+    b.dataset.key = prop.key;
+    b.dataset.value = prop.value;
+    b.title = `${prop.key}=${prop.value}`;
+    const k = document.createElement("span");
+    k.textContent = prop.key;
+    const v = document.createElement("span");
+    v.className = "props-val";
+    v.textContent = prop.value;
+    b.append(k, v);
+    list.appendChild(b);
+  }
+  filter.oninput = () => {
+    const q = filter.value.trim().toLowerCase();
+    for (const b of list.children) b.hidden = !!q && !b.dataset.key.toLowerCase().includes(q);
+  };
+  propsMenu.replaceChildren(filter, list);
+  placeProps();
+  filter.focus();
+}
+
+function editProp(name, key, value) {
+  const bool = value === "true" || value === "false";
+  const field = bool
+    ? `<select name="value">
+        <option value="true"${value === "true" ? " selected" : ""}>true</option>
+        <option value="false"${value === "false" ? " selected" : ""}>false</option>
+      </select>`
+    : `<input type="text" name="value" value="${esc(value)}" maxlength="1000" autocomplete="off">`;
+  ask(`<form>
+    <p>Change <strong>${esc(key)}</strong> for <strong>${esc(name)}</strong>.</p>
+    <label>Value ${field}</label>
+    <p class="muted">A running server needs a restart to use the new value.</p>
+    <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Save</button></div>
+  </form>`, (fields) => {
+    dlg.close();
+    run({cmd: "prop", name, key, value: fields.value || ""}, `Setting ${name} ${key}…`);
+  });
+  const input = dlg.querySelector("[name=value]");
+  input.focus();
+  if (input.select) input.select();
+}
+
+propsMenu.onclick = (ev) => {
+  const b = ev.target.closest("button[data-key]");
+  if (!b) return;
+  const name = propsMenu.dataset.name;
+  closeProps();
+  if (rowBusy) return;
+  editProp(name, b.dataset.key, b.dataset.value);
+};
+
+propsMenu.onkeydown = (ev) => {
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeProps(true);
+    return;
+  }
+  if (ev.key !== "ArrowDown" && ev.key !== "ArrowUp") return;
+  const items = [...propsMenu.querySelectorAll("button[data-key]")].filter((b) => !b.hidden);
+  if (!items.length) return;
+  ev.preventDefault();
+  const i = items.indexOf(document.activeElement);
+  const down = ev.key === "ArrowDown";
+  const next = i < 0 ? items[down ? 0 : items.length - 1] : items[(i + (down ? 1 : items.length - 1)) % items.length];
+  next.focus();
+};
+
+document.addEventListener("pointerdown", (ev) => {
+  if (propsMenu.hidden) return;
+  if (propsMenu.contains(ev.target) || (propsAnchor && propsAnchor.contains(ev.target))) return;
+  closeProps();
+});
+window.addEventListener("resize", placeProps);
+
 function clearSearch() {
   if (searchAbort) searchAbort.abort();
   document.getElementById("search-q").value = "";
@@ -1190,6 +1413,8 @@ document.getElementById("search-form").onsubmit = async (ev) => {
         show(`Installing ${item.name}…`);
         api("/api/install", {id: String(item.id)}).then((res) => {
           if (res) show(res.output || (res.ok ? "Done." : "Failed."));
+        }).catch((err) => {
+          show(err instanceof ApiTimeout ? err.message : "The page could not reach the server.");
         }).finally(() => { hold = false; loadPacks(true); });
       };
       list.appendChild(b);
@@ -1204,7 +1429,14 @@ document.getElementById("search-form").onsubmit = async (ev) => {
   }
 };
 
+document.getElementById("unlock").onclick = () => {
+  clearBusy();
+  loadPacks(true);
+};
+
 if (!restoreState()) out.textContent = "Loading…";
+// The saved table may have been stored while a row was busy.
+clearBusy();
 loadPacks();
 setInterval(loadPacks, 5000);
 setInterval(refreshConsole, 2000);
@@ -1380,6 +1612,10 @@ class Handler(BaseHTTPRequestHandler):
             offset = (query.get("offset") or ["0"])[0]
             self.handle_log(name, offset)
             return
+        if parsed.path == "/api/props":
+            query = parse_qs(parsed.query or "")
+            self.handle_props((query.get("name") or [""])[0])
+            return
         self.send_json(404, {"ok": False, "output": "Not found."})
 
     def do_POST(self):
@@ -1471,6 +1707,22 @@ class Handler(BaseHTTPRequestHandler):
             str(body.get("command") or ""),
         ], 30)
 
+    def handle_props(self, name):
+        try:
+            proc = modman_call(["props", name], 30)
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {"ok": False, "output": "Timed out reading server.properties."})
+            return
+        if proc.returncode != 0:
+            self.send_json(400, {"ok": False, "output": command_text(proc)})
+            return
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            self.send_json(500, {"ok": False, "output": command_text(proc)})
+            return
+        self.send_json(200, data)
+
     def handle_log(self, name, offset):
         if not str(offset).isdigit() or len(str(offset)) > 18:
             offset = "0"
@@ -1510,6 +1762,8 @@ class Handler(BaseHTTPRequestHandler):
                     args.append("agree")
         elif cmd == "port":
             args.extend([name, str(body.get("port") or "")])
+        elif cmd == "prop":
+            args.extend([name, str(body.get("key") or ""), str(body.get("value") or "")])
         elif cmd == "uninstall":
             args.extend([name, str(body.get("confirm") or "")])
         elif cmd == "service":

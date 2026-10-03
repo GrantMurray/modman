@@ -140,6 +140,8 @@ Each modpack is a folder under `/srv/minecraft`. The folder name is the name you
 
 `server.properties` holds the port on a `server-port=` line. `list` and `status` show that port, and the `port` command writes it. When the file or the line is missing, the port column shows `-`.
 
+`edit MyPack` lists every value in `server.properties` with a number. Type a number or a property name, then the new value. Settings that are true or false only take true or false, and whole-number settings only take whole numbers. Only existing settings can be changed, and the file is only there after the server has started once. A running server picks up the change after a restart. On the webpage, each server's **Properties** menu does the same.
+
 When `start.sh` does not name a `java` program, modman reads `JAVA=` from `variables.txt` and uses that path for the Java version column.
 
 The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting**, **running**, and **error** apart.
@@ -216,7 +218,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 ## The control page
 
-`web start` starts the page with the saved password. https is on port 8787. http on port 8788 only hands out the certificate, answers Let's Encrypt, and sends everything else to https. The page lists every modpack. Enabled servers have start, stop, and restart. A server that is only installed does not, so a one-off test of that server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running. Every server has enable or disable, the port, update, and uninstall. The console list has Actions plus each running server, and a server console keeps updating. Actions shows button results, such as stopping a modpack. The command box sends one line to the selected server.
+`web start` starts the page with the saved password. https is on port 8787. http on port 8788 only hands out the certificate, answers Let's Encrypt, and sends everything else to https. The page lists every modpack. Enabled servers have start, stop, and restart. A server that is only installed does not, so a one-off test of that server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running. Every server has enable or disable, the port, a Properties menu for `server.properties`, update, and uninstall. The console list has Actions plus each running server, and a server console keeps updating. Actions shows button results, such as stopping a modpack. The command box sends one line to the selected server.
 
 Update still asks whether to keep or delete the world. Choosing delete asks you to type yes.
 
@@ -272,14 +274,14 @@ If the pack has no `start.sh`, modman renames `run.sh` (or another launch script
 
 The CurseForge project id, and the server pack file id, are written to `.curseforge-id` in that folder so a later update can tell which project the folder came from.
 
-`update MyPack` installs a newer server pack into a folder that is already there. It asks whether to keep or delete the world. Choosing delete asks you to type yes before the world, `world_nether`, and `world_the_end` are removed. `server.properties`, ops, whitelist, bans, and `eula.txt` stay either way. It then asks you to type yes before the update. A running server is stopped first. When the new pack has no `start.sh`, modman writes one the same way `install` does. If the folder has no `.curseforge-id`, modman searches CurseForge using the folder name. When that search has no matches, it asks for a modpack name and lists results the same way `install` does.
+`update MyPack` installs a newer server pack into a folder that is already there. It first asks where the pack comes from: CurseForge (the default, press Enter), a download link such as Google Drive, OneDrive, or Dropbox, or a local zip file. A link must be shared so anyone with it can view the file, and must point at the zip, not a folder. Updating from a link or zip removes `.curseforge-id`, so a later CurseForge update searches for the project again. The webpage always updates from CurseForge. It then asks whether to keep or delete the world. Choosing delete asks you to type yes before the world, `world_nether`, and `world_the_end` are removed. `server.properties`, ops, whitelist, bans, and `eula.txt` stay either way. It then asks you to type yes before the update. A running server is stopped first. When the new pack has no `start.sh`, modman writes one the same way `install` does. For a CurseForge update, if the folder has no `.curseforge-id`, modman searches CurseForge using the folder name. When that search has no matches, it asks for a modpack name and lists results the same way `install` does.
 
 ## Change a server
 
 | Command | What it does |
 | --- | --- |
 | `install` | Searches CurseForge and installs the server pack you pick |
-| `update MyPack` | Installs a newer server pack into that folder, after you type yes. Asks whether to keep or delete the world |
+| `update MyPack` | Installs a newer server pack from CurseForge, a download link, or a local zip into that folder, after you type yes. Asks whether to keep or delete the world |
 | `enable MyPack` | Puts that server in the index so it starts with the others |
 | `disable MyPack` | Stops it if it is running, then takes it out of the index |
 | `uninstall MyPack` | Asks you to type yes, then deletes that server folder. Stops it first if it is running, and takes it out of the index if it was listed |
