@@ -491,6 +491,11 @@ APP_PAGE = r"""<!DOCTYPE html>
   .section-head h2 { margin: 0; font-size: 1.05rem; font-weight: 650; }
   .section-head .primary { margin-left: auto; }
   .group-title { display: flex; align-items: center; gap: 0.45rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 650; margin: 1.1rem 0 0.45rem; }
+  .group > summary { cursor: pointer; list-style: none; user-select: none; width: fit-content; }
+  .group > summary::-webkit-details-marker { display: none; }
+  .group > summary::before { content: "\25B8"; font-size: 0.85rem; transition: transform 0.15s; }
+  .group[open] > summary::before { transform: rotate(90deg); }
+  .group > summary:hover { color: var(--text); }
   .count { font-size: 0.72rem; background: var(--idle-bg); color: var(--muted); border-radius: 999px; padding: 0 0.45rem; letter-spacing: 0; }
   .empty { padding: 1.25rem; color: var(--muted); }
 
@@ -630,6 +635,7 @@ APP_PAGE = r"""<!DOCTYPE html>
     .table-card { background: none; border: 0; box-shadow: none; overflow: visible; }
     #packs table, #packs tbody, #packs tr, #packs td { display: block; }
     #packs thead { display: none; }
+    .group > summary { min-height: 2.75rem; margin: 0.3rem 0; padding-right: 1rem; }
     #packs tr { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 0.65rem; padding: 0.65rem 0.8rem; }
     #packs tbody tr:hover { background: var(--surface); }
     #packs td { border: 0; padding: 0; }
@@ -694,9 +700,9 @@ APP_PAGE = r"""<!DOCTYPE html>
     <form id="console-form" class="console-form">
       <div class="pick">
         <select id="console-pack" aria-label="Server" hidden>
-          <option value="">Choose a server</option>
+          <option value="">Actions</option>
         </select>
-        <button type="button" id="console-pick-btn" class="pick-btn" aria-haspopup="listbox" aria-expanded="false">Choose a server</button>
+        <button type="button" id="console-pick-btn" class="pick-btn" aria-haspopup="listbox" aria-expanded="false">Actions</button>
         <div id="console-pick-menu" class="pick-menu" role="listbox" aria-label="Server" hidden></div>
       </div>
       <input id="console-cmd" type="text" maxlength="300" placeholder="Command (↑ for history)" autocomplete="off" aria-label="Command">
@@ -1162,11 +1168,38 @@ function row(pack) {
 function table(title, rows, usage) {
   if (!rows.length) return "";
   const usageHead = usage ? "<th>Status</th><th>CPU</th><th>RAM</th><th>Uptime</th>" : "";
-  return `<h3 class="group-title">${esc(title)} <span class="count">${rows.length}</span></h3>
-    <div class="card table-card"><table>
+  return `<div class="card table-card"><table>
     <thead><tr><th>Server</th>${usageHead}<th><span hidden>Actions</span></th></tr></thead>
     <tbody>${rows.map(row).join("")}</tbody></table></div>`;
 }
+
+// The Installed list folds away. It starts folded on phones, where it is long,
+// and after that keeps whatever this browser last chose.
+const INSTALLED_KEY = "modman-installed-open";
+
+function installedOpen() {
+  try {
+    const saved = localStorage.getItem(INSTALLED_KEY);
+    if (saved === "1" || saved === "0") return saved === "1";
+  } catch (err) {}
+  return !matchMedia("(max-width: 40rem)").matches;
+}
+
+function installedGroup(rows) {
+  if (!rows.length) return "";
+  return `<details class="group" data-group="installed"${installedOpen() ? " open" : ""}>
+    <summary class="group-title">Installed <span class="count">${rows.length}</span></summary>
+    ${table("Installed", rows, false)}
+  </details>`;
+}
+
+// toggle does not bubble, so listen while it travels down.
+document.getElementById("packs").addEventListener("toggle", (ev) => {
+  if (!ev.target.matches || !ev.target.matches('details[data-group="installed"]')) return;
+  try { localStorage.setItem(INSTALLED_KEY, ev.target.open ? "1" : "0"); } catch (err) {}
+  if (!ev.target.open) closeRowMenu();
+  saveState();
+}, true);
 
 function paintDot(id, good, label) {
   const el = document.getElementById(id);
@@ -1189,7 +1222,8 @@ function render() {
       : "Loading servers…"}</div>`;
     return;
   }
-  box.innerHTML = table("Active", indexed, true) + table("Installed", other, false);
+  box.innerHTML = (indexed.length ? `<h3 class="group-title">Active <span class="count">${indexed.length}</span></h3>` : "")
+    + table("Active", indexed, true) + installedGroup(other);
   // A properties menu open on a row follows the redrawn row's ⋯ button.
   if (!propsMenu.hidden && propsAnchor && !propsAnchor.isConnected) {
     propsAnchor = moreButton(propsMenu.dataset.name);
@@ -1341,7 +1375,7 @@ function fillPickMenu() {
 function syncPick() {
   const sel = document.getElementById("console-pack");
   const opt = sel.options[sel.selectedIndex];
-  const label = opt ? opt.textContent : "Choose a server";
+  const label = opt ? opt.textContent : "Actions";
   if (pickBtn.textContent !== label) pickBtn.textContent = label;
   if (pickOpen()) fillPickMenu();
 }
@@ -1401,7 +1435,7 @@ function consoleLabel(pack) {
 // Update the options in place, only when the names or labels changed.
 function fillPicker(list) {
   const sel = document.getElementById("console-pack");
-  const wanted = [["", "Choose a server"], ...list.map((p) => [p.name, consoleLabel(p)])];
+  const wanted = [["", "Actions"], ...list.map((p) => [p.name, consoleLabel(p)])];
   const same = wanted.length === sel.options.length &&
     wanted.every(([value, label], i) => sel.options[i].value === value && sel.options[i].textContent === label);
   if (!same) {
