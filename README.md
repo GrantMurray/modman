@@ -85,19 +85,15 @@ modman
 
 At the `modman>` prompt, run `install`, search for a modpack, and pick a number from the list. The pack goes into `/srv/minecraft/<PackName>`, with spaces removed from the name.
 
-Minecraft will not start until you accept its [EULA](https://aka.ms/MinecraftEULA). Leave modman with `exit`, then run this, using the folder name `install` printed:
-
-```bash
-echo "eula=true" > /srv/minecraft/MyPack/eula.txt
-```
-
-Back in `modman`:
+Then enable and start it, using the folder name `install` printed:
 
 ```text
 enable MyPack
 start MyPack
 status
 ```
+
+Minecraft will not start until you accept its [EULA](https://aka.ms/MinecraftEULA). The first `start` shows the link and asks you to type yes, then writes `eula=true` to the pack's `eula.txt` for you. The control page asks the same with an **I agree** button. The boot service cannot ask, so it skips a pack whose EULA has not been accepted; start that pack once from the prompt or the page first.
 
 `status` shows **starting** while the server loads, then **running**. `join MyPack` opens its console; press **Ctrl-A**, then **d**, to leave it running.
 
