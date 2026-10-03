@@ -256,6 +256,20 @@ is_running() {
 	screen -ls 2>/dev/null | grep -E "\.${session}[[:space:]]" | grep -vq 'Dead'
 }
 
+# True when the log was last written no later than the second this pack's
+# screen session started. Unknown start time counts as not older.
+log_older_than_session() {
+	local name="$1" log="$2"
+	local pid elapsed mtime
+	pid="$(screen -ls 2>/dev/null | grep -E "\.$(screen_name "$name")[[:space:]]" | grep -v 'Dead' |
+		head -n 1 | grep -oE '^[[:space:]]*[0-9]+' | tr -d '[:space:]')"
+	[[ -n "$pid" ]] || return 1
+	elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+	mtime="$(stat -c %Y "$log" 2>/dev/null)"
+	[[ "$elapsed" =~ ^[0-9]+$ && "$mtime" =~ ^[0-9]+$ ]] || return 1
+	((mtime <= $(date +%s) - elapsed))
+}
+
 # Display helper only. Prints starting, running, or error from latest.log.
 # A new boot line clears an earlier crash in the same file.
 _log_boot_state() {
@@ -267,6 +281,12 @@ _log_boot_state() {
 	fi
 	log="$MINECRAFT_ROOT/$name/logs/latest.log"
 	if [[ ! -f "$log" ]]; then
+		printf '%s' "starting"
+		return 0
+	fi
+	# Until the new server rotates latest.log, the file is the last run's and
+	# can end in Done. Not written since this screen session began means stale.
+	if log_older_than_session "$name" "$log"; then
 		printf '%s' "starting"
 		return 0
 	fi

@@ -314,6 +314,16 @@ def wait_for_log(name, offset, conn, key, turn):
     return "timeout"
 
 
+# The page resends a POST whose connection failed, with the same X-Request-Id.
+# (session, id) -> [finished event, (code, reply) or None, when]. A resend
+# gets the first try's reply, so an action never runs twice. Finished entries
+# are kept REPLY_KEEP seconds.
+replies = {}
+replies_lock = threading.Lock()
+REQUEST_ID_RE = re.compile(r"[A-Za-z0-9]{16,40}")
+REPLY_KEEP = 600
+
+
 def parse_log_frame(stdout):
     header, sep, body = stdout.partition("\n")
     if not sep:
@@ -335,12 +345,23 @@ def command_text(proc):
     return "\n".join(part for part in parts if part)
 
 
+# Both pages link this icon, so browsers do not fetch /favicon.ico and log the
+# empty answer as an error.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+    '<rect width="16" height="16" rx="3" fill="#1f3d2d"/>'
+    '<rect x="3" y="3" width="10" height="10" fill="#c8c2b4"/>'
+    '<rect x="3" y="3" width="10" height="3" fill="#5f9e3a"/>'
+    '</svg>'
+).encode("utf-8")
+
 LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>modman</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
   body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: #f3f0e8; color: #1c1c1c; }
   main { max-width: 22rem; margin: 12vh auto; background: #fff; padding: 1.5rem; border: 1px solid #ddd; }
@@ -388,6 +409,7 @@ APP_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>modman</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
   body { margin: 0; font: 15px/1.4 system-ui, sans-serif; background: #f3f0e8; color: #1c1c1c; }
   header { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: center; background: #1f3d2d; color: #f4f1ea; padding: 0.8rem 1rem; }
@@ -633,20 +655,30 @@ async function api(path, body, signal) {
   if (body !== undefined) {
     opts.method = "POST";
     opts.headers["Content-Type"] = "application/json";
+    // The server answers a resend with this id from the first try's reply.
+    opts.headers["X-Request-Id"] = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+      (b) => b.toString(16).padStart(2, "0")).join("");
     opts.body = JSON.stringify(body);
   }
   try {
-    const res = await fetch(path, opts);
-    if (res.status === 401) {
-      location.href = "/login";
-      return null;
+    // A connection can drop between requests, such as in the playit tunnel,
+    // and fail the next request with a reset. Try once more before giving up.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await fetch(path, opts);
+        if (res.status === 401) {
+          location.href = "/login";
+          return null;
+        }
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch { return {ok: false, output: text}; }
+      } catch (err) {
+        if (timedOut) throw new ApiTimeout();
+        if (attempt > 0 || ctrl.signal.aborted) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
     }
-    const text = await res.text();
-    try { return JSON.parse(text); }
-    catch { return {ok: false, output: text}; }
-  } catch (err) {
-    if (timedOut) throw new ApiTimeout();
-    throw err;
   } finally {
     pending.delete(ctrl);
     clearTimeout(timer);
@@ -1295,6 +1327,9 @@ document.getElementById("packs").onclick = async (ev) => {
     return;
   }
   if (act === "log") {
+    // The console sits below the list, often off screen.
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    document.querySelector(".console-head").scrollIntoView({behavior: reduce ? "auto" : "smooth", block: "start"});
     // A running server streams into the console. A stopped one shows its last log once.
     if (runningPacks().some((p) => p.name === name)) {
       followConsole(name);
@@ -1693,6 +1728,13 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "modman"
     timeout = 60
+    # How long a kept-alive connection may sit idle between requests. Browsers
+    # drop idle connections after at most 300 seconds (Chrome), so this outlasts
+    # them and the browser always hangs up first. When the server hung up first,
+    # the playit tunnel could still pass the browser's next request on to the
+    # closed socket, and that request failed with a connection reset.
+    idle_timeout = 330
+    reply_key = None
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -1712,7 +1754,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.tls_failed:
             self.close_connection = True
             return
-        super().handle()
+        self.close_connection = True
+        self.handle_one_request()
+        while not self.close_connection and self.wait_for_request():
+            self.handle_one_request()
+
+    def wait_for_request(self):
+        # Only the wait for a request's first byte gets idle_timeout. The rest
+        # of it is read under the shorter timeout again.
+        try:
+            self.connection.settimeout(self.idle_timeout)
+            return bool(self.rfile.peek(1))
+        except (OSError, ValueError):
+            return False
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
 
     def end_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -1741,8 +1800,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_html(self, code, html, csp):
         data = html.encode("utf-8")
+        # The app page is about 53 kB and gzips to about 15 kB. Neither page
+        # carries a secret, so BREACH does not apply.
+        gzipped = len(data) > 512 and "gzip" in self.headers.get("Accept-Encoding", "")
+        if gzipped:
+            data = gzip.compress(data, compresslevel=6)
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        if gzipped:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", csp)
@@ -1756,6 +1823,10 @@ class Handler(BaseHTTPRequestHandler):
         gzipped = len(data) > 512 and "gzip" in self.headers.get("Accept-Encoding", "")
         if gzipped:
             data = gzip.compress(data, compresslevel=6)
+        # Kept before writing, which fails if the browser's connection died.
+        if self.reply_key is not None:
+            with replies_lock:
+                replies[self.reply_key][1] = (code, obj)
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         if gzipped:
@@ -1765,6 +1836,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def start_reply(self, key):
+        # True when this request should run. A resend of one already seen
+        # instead waits for the first to finish and gets its reply.
+        now = time.monotonic()
+        with replies_lock:
+            for old in [k for k, v in replies.items() if v[0].is_set() and now - v[2] > REPLY_KEEP]:
+                del replies[old]
+            entry = replies.get(key)
+            if entry is None:
+                replies[key] = [threading.Event(), None, now]
+                self.reply_key = key
+                return True
+        entry[0].wait()
+        if entry[1] is None:
+            self.send_json(500, {"ok": False, "output": "The request failed. Try again."})
+        else:
+            self.send_json(*entry[1])
+        return False
+
+    def finish_reply(self):
+        key, self.reply_key = self.reply_key, None
+        with replies_lock:
+            entry = replies[key]
+            entry[2] = time.monotonic()
+            entry[0].set()
 
     def redirect(self, location, cookie=None):
         self.send_response(303)
@@ -1818,6 +1915,14 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path == "/modman-ca.crt":
             self.send_ca()
+            return True
+        if path == "/favicon.svg":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(FAVICON_SVG)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(FAVICON_SVG)
             return True
         if path == "/favicon.ico":
             self.send_response(204)
@@ -1887,22 +1992,34 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             self.send_json(400, {"ok": False, "output": "Bad JSON."})
             return
-        if parsed.path == "/api/run":
+        request_id = self.headers.get("X-Request-Id", "")
+        if not REQUEST_ID_RE.fullmatch(request_id):
+            self.route_post(parsed.path, body)
+            return
+        if not self.start_reply((self.cookie_token(), request_id)):
+            return
+        try:
+            self.route_post(parsed.path, body)
+        finally:
+            self.finish_reply()
+
+    def route_post(self, path, body):
+        if path == "/api/run":
             self.handle_run(body)
             return
-        if parsed.path == "/api/search":
+        if path == "/api/search":
             self.handle_search(body)
             return
-        if parsed.path == "/api/install":
+        if path == "/api/install":
             self.handle_install(body)
             return
-        if parsed.path == "/api/update":
+        if path == "/api/update":
             self.handle_update(body)
             return
-        if parsed.path == "/api/update-check":
+        if path == "/api/update-check":
             self.handle_update_check(body)
             return
-        if parsed.path == "/api/command":
+        if path == "/api/command":
             self.handle_command(body)
             return
         self.send_json(404, {"ok": False, "output": "Not found."})
