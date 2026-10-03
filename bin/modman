@@ -2738,6 +2738,69 @@ stage_archive_pack() {
 	printf '%s\n%s\n%s\n' "$work" "$root" "$generated"
 }
 
+# Looks up the newest server pack and compares it with the installed one.
+# Sets UPD_FILE, UPD_LATEST (version name), UPD_VERSIONS (Minecraft),
+# UPD_RELEASE_NAME, UPD_RELEASE_DATE, UPD_KNOWN_VERSION, UPD_KNOWN_DATE, and
+# UPD_STATE: update, current, older, or unknown (no installed version saved).
+update_lookup() {
+	local key="$1"
+	local mod_id="$2"
+	local known_file="${3:-}"
+	local known_version="${4:-}"
+	local known_date="${5:-}"
+	local file_id meta display versions release release_name release_date
+
+	file_id="$(cf_server_pack_file "$key" "$mod_id")" || return 1
+	meta="$(cf_file_meta "$key" "$mod_id" "$file_id")" || return 1
+	IFS=$'\t' read -r display _ versions <<<"$meta"
+	release="$(cf_file_release "$key" "$mod_id" "$file_id")" || return 1
+	IFS=$'\x1f' read -r release_name release_date <<<"$release"
+
+	# Packs installed before the date was saved only have the file id.
+	if [[ -z "$known_date" && -n "$known_file" ]]; then
+		if release="$(cf_file_release "$key" "$mod_id" "$known_file")"; then
+			IFS=$'\x1f' read -r known_version known_date <<<"$release"
+		fi
+	fi
+
+	UPD_FILE="$file_id"
+	UPD_LATEST="${release_name:-$display}"
+	UPD_VERSIONS="$versions"
+	UPD_RELEASE_NAME="$release_name"
+	UPD_RELEASE_DATE="$release_date"
+	UPD_KNOWN_VERSION="$known_version"
+	UPD_KNOWN_DATE="$known_date"
+
+	# Version names do not sort reliably (6.43 came before 6.6.5), so compare
+	# release dates. ISO dates compare as text once cut to whole seconds.
+	if [[ -n "$known_file" && "$known_file" == "$file_id" ]]; then
+		UPD_STATE=current
+	elif [[ -n "$known_date" && -n "$release_date" ]]; then
+		if [[ "${release_date:0:19}" < "${known_date:0:19}" ]]; then
+			UPD_STATE=older
+		elif [[ "${release_date:0:19}" == "${known_date:0:19}" ]]; then
+			UPD_STATE=current
+		else
+			UPD_STATE=update
+		fi
+	elif [[ -n "$known_file" ]]; then
+		# A different file is out, but its date could not be compared.
+		UPD_STATE=update
+	else
+		UPD_STATE=unknown
+	fi
+}
+
+# One line comparing the installed version with the one update_lookup found.
+update_describe() {
+	local latest="${UPD_LATEST}${UPD_RELEASE_DATE:+ (released ${UPD_RELEASE_DATE:0:10})}"
+	if [[ "$UPD_STATE" == "unknown" ]]; then
+		echo "Installed version unknown; this will install ${latest}."
+	else
+		echo "Installed: ${UPD_KNOWN_VERSION:-unknown}${UPD_KNOWN_DATE:+ (released ${UPD_KNOWN_DATE:0:10})} -> Latest: ${latest}"
+	fi
+}
+
 update_modpack() {
 	local name="${1:-}"
 	local dest id_file key picked select_status=0
@@ -2820,40 +2883,32 @@ update_modpack() {
 		fi
 
 		echo "Looking up the server pack for ${mod_name}..."
-		file_id="$(cf_server_pack_file "$key" "$mod_id")" || return 1
-		if [[ -n "$known_file" && "$known_file" == "$file_id" ]]; then
-			echo "'${name}' is already on the latest version."
+		update_lookup "$key" "$mod_id" "$known_file" "$known_version" "$known_date" || return 1
+		file_id="$UPD_FILE"
+		release_name="$UPD_RELEASE_NAME"
+		release_date="$UPD_RELEASE_DATE"
+		case "$UPD_STATE" in
+		current)
+			echo "'${name}' is already on the latest version${UPD_LATEST:+ (${UPD_LATEST})}."
 			return 0
+			;;
+		older)
+			echo "Not updating '${name}': the newest server pack on CurseForge, ${UPD_LATEST} (released ${release_date:0:10}),"
+			echo "is older than the installed ${UPD_KNOWN_VERSION:-version} (released ${UPD_KNOWN_DATE:0:10})."
+			return 0
+			;;
+		esac
+		# The webpage passes the file it showed, so a release that lands
+		# between the check and the click is not installed unseen.
+		if [[ -n "${MODMAN_EXPECT_FILE:-}" && "$MODMAN_EXPECT_FILE" != "$file_id" ]]; then
+			echo "Error: the newest version on CurseForge changed to ${UPD_LATEST} since the check. Open Update again to review it." >&2
+			return 1
 		fi
-		meta="$(cf_file_meta "$key" "$mod_id" "$file_id")" || return 1
-		IFS=$'\t' read -r display _ versions <<<"$meta"
-		release="$(cf_file_release "$key" "$mod_id" "$file_id")" || return 1
-		IFS=$'\x1f' read -r release_name release_date <<<"$release"
-
-		# Packs installed before the date was saved only have the file id.
-		if [[ -z "$known_date" && -n "$known_file" ]]; then
-			if release="$(cf_file_release "$key" "$mod_id" "$known_file")"; then
-				IFS=$'\x1f' read -r known_version known_date <<<"$release"
-			fi
-		fi
-		# Version names do not sort reliably (6.43 came before 6.6.5), so compare
-		# release dates. ISO dates compare as text once cut to whole seconds.
-		if [[ -n "$known_date" && -n "$release_date" ]]; then
-			if [[ "${release_date:0:19}" < "${known_date:0:19}" ]]; then
-				echo "Not updating '${name}': the newest server pack on CurseForge, ${release_name:-$display} (released ${release_date:0:10}),"
-				echo "is older than the installed ${known_version:-version} (released ${known_date:0:10})."
-				return 0
-			fi
-			if [[ "${release_date:0:19}" == "${known_date:0:19}" ]]; then
-				echo "'${name}' is already on the latest version."
-				return 0
-			fi
-		fi
-
-		if [[ -n "$versions" ]]; then
-			echo "Update ${name} to ${display} (Minecraft ${versions})?"
+		update_describe
+		if [[ -n "$UPD_VERSIONS" ]]; then
+			echo "Update ${name} to ${UPD_LATEST} (Minecraft ${UPD_VERSIONS})?"
 		else
-			echo "Update ${name} to ${display}?"
+			echo "Update ${name} to ${UPD_LATEST}?"
 		fi
 	else
 		echo "Update ${name} from ${source_arg}?"
@@ -3309,6 +3364,7 @@ web_update() {
 	local confirm="${3:-}"
 	local delete_confirm="${4:-}"
 	local mod_id="${5:-}"
+	local expect_file="${6:-}"
 	if ! valid_modpack_name "$name"; then
 		echo "Error: '$name' is not a modpack name." >&2
 		return 1
@@ -3335,7 +3391,60 @@ web_update() {
 		echo "Error: bad CurseForge project id." >&2
 		return 1
 	fi
-	MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_MOD_ID="$mod_id" update_modpack "$name"
+	if [[ -n "$expect_file" && ! "$expect_file" =~ ^[0-9]+$ ]]; then
+		echo "Error: bad CurseForge file id." >&2
+		return 1
+	fi
+	MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_MOD_ID="$mod_id" MODMAN_EXPECT_FILE="$expect_file" \
+		update_modpack "$name"
+}
+
+# JSON for the webpage's update dialog: the installed and newest versions,
+# without changing anything. MOD_ID is the search pick when the folder has no
+# .curseforge-id; a saved id wins, as it does in update_modpack.
+web_update_check() {
+	local name="${1:-}"
+	local mod_id="${2:-}"
+	local key picked dest
+	local known_file="" known_version="" known_date=""
+	require_modpack "$name" || return 1
+	dest="${MINECRAFT_ROOT}/${name}"
+	if [[ -L "$dest" || ! -d "$dest" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if [[ -n "$mod_id" && ! "$mod_id" =~ ^[0-9]+$ ]]; then
+		echo "Error: bad CurseForge project id." >&2
+		return 1
+	fi
+	if picked="$(read_curseforge_id "${dest}/.curseforge-id")"; then
+		IFS=$'\x1f' read -r mod_id known_file known_version known_date <<<"$picked"
+	elif [[ -z "$mod_id" ]]; then
+		echo "Error: no CurseForge id saved. Choose the modpack in the search." >&2
+		return 1
+	fi
+	key="$(read_curseforge_key)" || return 1
+	update_lookup "$key" "$mod_id" "$known_file" "$known_version" "$known_date" || return 1
+	UPD_STATE="$UPD_STATE" UPD_FILE="$UPD_FILE" UPD_LATEST="$UPD_LATEST" \
+		UPD_VERSIONS="$UPD_VERSIONS" UPD_RELEASE_DATE="$UPD_RELEASE_DATE" \
+		UPD_KNOWN_VERSION="$UPD_KNOWN_VERSION" UPD_KNOWN_DATE="$UPD_KNOWN_DATE" \
+		UPD_MOD_ID="$mod_id" python3 -c 'import json, os
+e = os.environ
+installed = None
+if e["UPD_KNOWN_VERSION"] or e["UPD_KNOWN_DATE"]:
+    installed = {"version": e["UPD_KNOWN_VERSION"], "date": e["UPD_KNOWN_DATE"][:10]}
+print(json.dumps({
+    "ok": True,
+    "state": e["UPD_STATE"],
+    "mod_id": e["UPD_MOD_ID"],
+    "installed": installed,
+    "latest": {
+        "file": e["UPD_FILE"],
+        "version": e["UPD_LATEST"],
+        "date": e["UPD_RELEASE_DATE"][:10],
+        "minecraft": e["UPD_VERSIONS"],
+    },
+}))'
 }
 
 web_run() {
@@ -3407,7 +3516,8 @@ web_call() {
 	props) web_properties "${1:-}" ;;
 	search) web_search "${1:-}" ;;
 	install) web_install_modpack "${1:-}" ;;
-	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+	updatecheck) web_update_check "${1:-}" "${2:-}" ;;
 	run) web_run "$@" ;;
 	*)
 		echo "Error: unknown web call." >&2

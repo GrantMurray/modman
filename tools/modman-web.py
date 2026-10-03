@@ -382,6 +382,8 @@ APP_PAGE = r"""<!DOCTYPE html>
   .results button { display: block; width: 100%; text-align: left; margin-bottom: 0.25rem; }
   .results button.on { outline: 2px solid #1f3d2d; }
   .muted { color: #555; font-size: 0.9rem; }
+  .upd-check { padding: 0.45rem 0.6rem; background: #f3f0e8; border-left: 3px solid #6d7a72; }
+  .upd-check.warn { border-left-color: #9a3412; color: #7c2d12; }
   .row-actions { display: flex; gap: 0.4rem; justify-content: flex-end; margin-top: 0.8rem; }
   .svc-state { display: inline-flex; align-items: center; gap: 0.35rem; }
   .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: #e15d5d; }
@@ -526,7 +528,7 @@ function esc(s) {
 const API_TIMEOUTS = {
   "/api/run": 180, "/api/packs": 120, "/api/log": 30, "/api/command": 30,
   "/api/search": 60, "/api/install": 3600, "/api/update": 3600,
-  "/api/props": 30,
+  "/api/props": 30, "/api/update-check": 90,
 };
 const API_MARGIN = 15;
 
@@ -1230,12 +1232,14 @@ document.getElementById("packs").onclick = async (ev) => {
     ask(`<form>
       <p>Update <strong>${esc(name)}</strong>.</p>
       ${search}
+      <p id="upd-check" class="upd-check muted">${pack && pack.curseforge ? "Checking CurseForge…" : "Pick a modpack to see its newest version."}</p>
       <label><input type="radio" name="world" value="keep" checked> Keep the world</label>
       <label><input type="radio" name="world" value="delete"> Delete the world</label>
       <label id="del-label" hidden>Type yes to delete the world <input name="delete_confirm" autocomplete="off"></label>
       <label>Type yes to update <input name="confirm" autocomplete="off" required></label>
-      <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Update</button></div>
+      <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit" id="upd-go" disabled>Update</button></div>
     </form>`, (fields) => {
+      if (!checked) return;
       const world = fields.world || "keep";
       if (String(fields.confirm).toLowerCase() !== "yes") { show("Cancelled."); dlg.close(); return; }
       if (world === "delete" && String(fields.delete_confirm || "").toLowerCase() !== "yes") {
@@ -1250,11 +1254,61 @@ document.getElementById("packs").onclick = async (ev) => {
       const payload = {
         name, world,
         confirm: "yes",
-        delete_confirm: world === "delete" ? "yes" : ""
+        delete_confirm: world === "delete" ? "yes" : "",
+        file: checked.file
       };
       if (fields.mod_id) payload.mod_id = fields.mod_id;
       finishServer(name, `Updating ${name}…`, () => api("/api/update", payload));
     });
+    // The Update button stays off until a check shows there is something to
+    // install. The file it showed goes with the request, so the server refuses
+    // if a newer release lands in between.
+    const checkLine = dlg.querySelector("#upd-check");
+    const goBtn = dlg.querySelector("#upd-go");
+    let checked = null;
+    let checkTicket = 0;
+    const checkUpdate = async (modId) => {
+      const ticket = ++checkTicket;
+      checked = null;
+      goBtn.disabled = true;
+      checkLine.className = "upd-check muted";
+      checkLine.textContent = "Checking CurseForge…";
+      let data;
+      try {
+        data = await api("/api/update-check", {name, mod_id: modId || ""});
+      } catch (err) {
+        if (ticket !== checkTicket) return;
+        checkLine.textContent = err instanceof ApiTimeout ? err.message : "The page could not reach the server.";
+        return;
+      }
+      if (ticket !== checkTicket || !data) return;
+      if (!data.ok || !data.latest) {
+        checkLine.className = "upd-check warn";
+        checkLine.textContent = data.output || "Could not check for updates.";
+        return;
+      }
+      const when = (d) => (d ? ` (released ${d})` : "");
+      const latest = data.latest.version + when(data.latest.date)
+        + (data.latest.minecraft ? `, Minecraft ${data.latest.minecraft}` : "");
+      const inst = data.installed;
+      const installed = inst ? (inst.version || "unknown") + when(inst.date) : "";
+      checkLine.className = "upd-check";
+      if (data.state === "current") {
+        checkLine.textContent = `Already on the latest version: ${latest}.`;
+      } else if (data.state === "older") {
+        checkLine.className = "upd-check warn";
+        checkLine.textContent = `Not updating: the newest server pack, ${latest}, is older than the installed ${installed}.`;
+      } else if (data.state === "unknown") {
+        checkLine.className = "upd-check warn";
+        checkLine.textContent = `Installed version unknown. This will install ${latest}.`;
+        checked = data.latest;
+      } else {
+        checkLine.textContent = `Installed: ${installed} → Latest: ${latest}`;
+        checked = data.latest;
+      }
+      goBtn.disabled = !checked;
+    };
+    if (pack && pack.curseforge) checkUpdate("");
     dlg.querySelectorAll('input[name="world"]').forEach((el) => {
       el.onchange = () => {
         dlg.querySelector("#del-label").hidden = dlg.querySelector('input[name="world"]:checked').value !== "delete";
@@ -1290,6 +1344,7 @@ document.getElementById("packs").onclick = async (ev) => {
             dlg.querySelector("#upd-id").value = item.id;
             list.querySelectorAll("button").forEach((n) => n.classList.remove("on"));
             b.classList.add("on");
+            checkUpdate(String(item.id));
           };
           list.appendChild(b);
         });
@@ -1719,6 +1774,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/update":
             self.handle_update(body)
             return
+        if parsed.path == "/api/update-check":
+            self.handle_update_check(body)
+            return
         if parsed.path == "/api/command":
             self.handle_command(body)
             return
@@ -1866,7 +1924,28 @@ class Handler(BaseHTTPRequestHandler):
             str(body.get("confirm") or ""),
             str(body.get("delete_confirm") or ""),
             str(body.get("mod_id") or ""),
+            str(body.get("file") or ""),
         ], 3600)
+
+    def handle_update_check(self, body):
+        try:
+            proc = modman_call([
+                "updatecheck",
+                str(body.get("name") or ""),
+                str(body.get("mod_id") or ""),
+            ], 90)
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {"ok": False, "output": "Timed out checking CurseForge."})
+            return
+        if proc.returncode != 0:
+            self.send_json(400, {"ok": False, "output": command_text(proc)})
+            return
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            self.send_json(500, {"ok": False, "output": command_text(proc)})
+            return
+        self.send_json(200, data)
 
     def finish_call(self, args, timeout, eula=False):
         try:
