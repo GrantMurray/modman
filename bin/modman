@@ -972,7 +972,8 @@ edit_properties() {
 
 	key="${keys[$pick]}"
 	echo "$key is currently: ${values[$pick]}"
-	if ! read -r -e -i "${values[$pick]}" -p "New value for $key: " value; then
+	# IFS= keeps spaces at either end of the value, which matter in motd.
+	if ! IFS= read -r -e -i "${values[$pick]}" -p "New value for $key: " value; then
 		echo
 		return 1
 	fi
@@ -4297,8 +4298,8 @@ repl() {
 		history -s "$line"
 		history -a "$HISTFILE" 2>/dev/null || true
 
-		# shellcheck disable=SC2206
-		args=($line)
+		# Split on whitespace without glob expansion, so "stop *" stays literal.
+		read -r -a args <<<"$line"
 		set +e
 		dispatch "${args[@]}"
 		local status=$?

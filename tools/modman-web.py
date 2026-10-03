@@ -386,6 +386,49 @@ APP_PAGE = r"""<!DOCTYPE html>
   .svc-state { display: inline-flex; align-items: center; gap: 0.35rem; }
   .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: #e15d5d; }
   .dot.on { background: #3dce6e; }
+
+  /* Phones: each server becomes a card with labelled lines, and controls get
+     finger-sized. Inputs use 16px so iOS does not zoom in on focus. */
+  @media (max-width: 40rem) {
+    main { padding: 0.75rem; }
+    header { padding: 0.7rem 0.75rem; }
+    header button, .menu summary { min-height: 2.5rem; padding: 0.4rem 0.7rem; box-sizing: border-box; }
+    .header-end { gap: 0.5rem 0.75rem; }
+    .menu-panel button { min-height: 2.75rem; }
+    button, .pick-btn { min-height: 2.75rem; }
+    input, select { font-size: 16px; min-height: 2.75rem; box-sizing: border-box; }
+
+    #search-form { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    #search-q { flex: 1 1 100%; padding: 0.4rem; }
+    #search-form button { flex: 1; }
+    .results button { padding: 0.5rem; }
+
+    #packs table, #packs tbody, #packs tr, #packs td { display: block; }
+    #packs table { background: none; }
+    #packs thead { display: none; }
+    #packs tr { background: #fff; border: 1px solid #e4dfd4; margin-bottom: 0.75rem; padding: 0.4rem 0; }
+    #packs td { border: 0; padding: 0.3rem 0.75rem; }
+    #packs td[data-label] { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+    #packs td[data-label]::before { content: attr(data-label); flex: 0 0 4.5rem; font-size: 0.75rem; letter-spacing: 0.04em; color: #555; font-weight: 400; }
+    #packs td[data-pack-name] { font-size: 1.05rem; font-weight: 600; padding-top: 0.2rem; overflow-wrap: anywhere; }
+    #packs .actions input[type="number"], #packs td[data-label="Port"] input { width: 7rem; }
+    #packs .port-warn { flex: 1 0 100%; max-width: none; margin: 0; }
+    #packs td.actions { display: grid; grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr)); gap: 0.4rem; padding-top: 0.5rem; }
+    #packs .loadbar { grid-column: 1 / -1; }
+
+    .console-form .pick { flex: 1 1 100%; }
+    .console-form .pick-btn { width: 100%; }
+    .console-form input { min-width: 0; }
+    .pick-menu button { padding: 0.6rem 0.75rem; }
+    #out { max-height: 60vh; font-size: 13px; padding: 0.6rem; }
+
+    .props-menu { min-width: 0; width: calc(100vw - 1.5rem); }
+    .props-menu .props-list { max-height: 50vh; }
+    .props-menu button { padding: 0.6rem 0.75rem; }
+    .props-menu .props-val { max-width: 45%; }
+    dialog { width: calc(100vw - 2rem); box-sizing: border-box; }
+    .row-actions button { flex: 1; }
+  }
 </style>
 </head>
 <body>
@@ -704,15 +747,19 @@ function row(pack) {
       <button type="button" data-act="stop">Stop</button>
       <button type="button" data-act="restart">Restart</button>`
     : "";
+  // Installed packs are not started from the page, so they have no status or usage columns.
+  const usage = pack.indexed
+    ? `<td class="status ${esc(pack.status)}" data-label="Status">${esc(pack.status)}</td>
+    <td data-cpu data-label="CPU">${esc(pack.cpu)}</td>
+    <td data-ram data-label="RAM">${esc(pack.ram)}</td>
+    <td data-uptime data-label="Uptime">${esc(pack.uptime)}</td>`
+    : "";
   return `<tr data-name="${esc(pack.name)}">
-    <td>${esc(pack.name)}</td>
-    <td class="${javaWarning(pack) ? "java-warn" : ""}" title="${esc(javaWarning(pack))}">${esc(javaText(pack))}</td>
-    <td><input type="number" min="1" max="65535" value="${esc(port)}" data-port> <button type="button" data-act="port">Set</button>
+    <td data-pack-name>${esc(pack.name)}</td>
+    <td class="${javaWarning(pack) ? "java-warn" : ""}" data-label="Java" title="${esc(javaWarning(pack))}">${esc(javaText(pack))}</td>
+    <td data-label="Port"><input type="number" min="1" max="65535" value="${esc(port)}" data-port> <button type="button" data-act="port">Set</button>
       <div class="port-warn" data-port-warn>${esc(portWarning(pack))}</div></td>
-    <td class="status ${esc(pack.status)}">${esc(pack.status)}</td>
-    <td>${esc(pack.cpu)}</td>
-    <td>${esc(pack.ram)}</td>
-    <td>${esc(pack.uptime)}</td>
+    ${usage}
     <td class="actions">
       ${runBtns}
       ${indexBtn}
@@ -725,10 +772,11 @@ function row(pack) {
   </tr>`;
 }
 
-function table(title, rows) {
+function table(title, rows, usage) {
   if (!rows.length) return "";
+  const usageHead = usage ? "<th>Status</th><th>CPU</th><th>RAM</th><th>Uptime</th>" : "";
   return `<h2>${esc(title)}</h2><table>
-    <thead><tr><th>Modpack</th><th>Java</th><th>Port</th><th>Status</th><th>CPU</th><th>RAM</th><th>Uptime</th><th></th></tr></thead>
+    <thead><tr><th>Modpack</th><th>Java</th><th>Port</th>${usageHead}<th></th></tr></thead>
     <tbody>${rows.map(row).join("")}</tbody></table>`;
 }
 
@@ -744,7 +792,7 @@ function render() {
   const indexed = packs.filter((p) => p.indexed);
   const other = packs.filter((p) => !p.indexed);
   document.getElementById("packs").innerHTML =
-    table("Active", indexed) + table("Installed", other);
+    table("Active", indexed, true) + table("Installed", other, false);
 }
 
 function saveState() {
@@ -804,9 +852,10 @@ function updateVisibleStatus() {
     if (!tr) continue;
     const statusCell = tr.querySelector(".status");
     const cells = tr.children;
-    if (!statusCell || cells.length < 7) continue;
-    statusCell.className = `status ${pack.status}`;
-    statusCell.textContent = pack.status;
+    if (statusCell) {
+      statusCell.className = `status ${pack.status}`;
+      statusCell.textContent = pack.status;
+    }
     cells[1].textContent = javaText(pack);
     cells[1].className = javaWarning(pack) ? "java-warn" : "";
     cells[1].title = javaWarning(pack);
@@ -820,9 +869,10 @@ function updateVisibleStatus() {
       const text = portWarning(pack);
       if (warn.textContent !== text) warn.textContent = text;
     }
-    cells[4].textContent = pack.cpu;
-    cells[5].textContent = pack.ram;
-    cells[6].textContent = pack.uptime;
+    for (const [attr, text] of [["data-cpu", pack.cpu], ["data-ram", pack.ram], ["data-uptime", pack.uptime]]) {
+      const cell = tr.querySelector(`[${attr}]`);
+      if (cell && cell.textContent !== text) cell.textContent = text;
+    }
   }
 }
 
@@ -1214,10 +1264,25 @@ document.getElementById("packs").onclick = async (ev) => {
     if (searchBtn) {
       searchBtn.onclick = async () => {
         const query = dlg.querySelector('input[name="query"]').value;
-        const data = await api("/api/search", {query});
         const list = dlg.querySelector("#upd-results");
+        list.textContent = "Searching…";
+        searchBtn.disabled = true;
+        let data;
+        try {
+          data = await api("/api/search", {query});
+        } catch (err) {
+          list.textContent = err instanceof ApiTimeout ? err.message : "The page could not reach the server.";
+          return;
+        } finally {
+          searchBtn.disabled = false;
+        }
+        if (!data) return;
         list.innerHTML = "";
-        (data && data.results || []).forEach((item) => {
+        if (data.ok === false && !(data.results || []).length) {
+          list.textContent = data.output || "Search failed.";
+          return;
+        }
+        (data.results || []).forEach((item) => {
           const b = document.createElement("button");
           b.type = "button";
           b.textContent = `${item.name} (${item.downloads})`;
