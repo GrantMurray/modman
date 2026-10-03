@@ -363,19 +363,34 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <title>modman</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
-  body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: #f3f0e8; color: #1c1c1c; }
-  main { max-width: 22rem; margin: 12vh auto; background: #fff; padding: 1.5rem; border: 1px solid #ddd; }
-  h1 { margin: 0 0 0.4rem; font-size: 1.4rem; }
-  p { margin: 0 0 1rem; color: #444; }
-  label { display: block; font-size: 0.9rem; margin-bottom: 0.8rem; }
-  input { display: block; width: 100%; box-sizing: border-box; margin-top: 0.3rem; padding: 0.45rem; font: inherit; }
-  button { font: inherit; padding: 0.4rem 0.8rem; background: #1f3d2d; color: #fff; border: 0; cursor: pointer; }
-  .err { color: #8d1d1d; }
+  :root {
+    color-scheme: light;
+    --bg: #f4f2ec; --surface: #fff; --border: #e3ded3; --border-strong: #cdc6b7; --text: #1c1c1c; --muted: #5f5a52;
+    --accent: #2f6b47; --accent-hover: #275a3b; --bad: #a12a2a; --focus: #2f6b47;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #121412; --surface: #1b1e1b; --border: #2d322d; --border-strong: #3e453e; --text: #e8e5de; --muted: #a39e94;
+      --accent: #337a4f; --accent-hover: #3b8a5a; --bad: #f19090; --focus: #74cf93;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0 1rem; font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 22rem; margin: 14vh auto; background: var(--surface); padding: 1.75rem; border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.08); }
+  h1 { margin: 0 0 0.4rem; font-size: 1.4rem; display: flex; align-items: center; gap: 0.55rem; }
+  p { margin: 0 0 1.1rem; color: var(--muted); }
+  label { display: block; font-size: 0.9rem; margin-bottom: 1rem; }
+  input { display: block; width: 100%; margin-top: 0.35rem; padding: 0.55rem 0.7rem; font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 7px; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  button { width: 100%; font: inherit; font-weight: 600; padding: 0.55rem 0.8rem; background: var(--accent); color: #fff; border: 0; border-radius: 7px; cursor: pointer; }
+  button:hover { background: var(--accent-hover); }
+  .err { color: var(--bad); }
 </style>
 </head>
 <body>
 <main>
-  <h1>modman</h1>
+  <h1><img src="/favicon.svg" alt="" width="26" height="26"> modman</h1>
   <p>Sign in with the password set when this page was started.</p>
   __ERROR__
   <form id="login">
@@ -411,173 +426,288 @@ APP_PAGE = r"""<!DOCTYPE html>
 <title>modman</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
-  body { margin: 0; font: 15px/1.4 system-ui, sans-serif; background: #f3f0e8; color: #1c1c1c; }
-  header { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: center; background: #1f3d2d; color: #f4f1ea; padding: 0.8rem 1rem; }
-  header h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
-  header button, .tools button, .row button, dialog button { font: inherit; background: #fff; color: #1c1c1c; border: 1px solid #c8c2b4; padding: 0.25rem 0.55rem; cursor: pointer; }
-  header button { background: transparent; color: #f4f1ea; border-color: #8eaa98; }
-  .header-end { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1rem; }
+  :root {
+    color-scheme: light;
+    --bg: #f4f2ec; --surface: #fff; --surface-2: #f9f7f2; --border: #e3ded3; --border-strong: #cdc6b7;
+    --text: #1c1c1c; --muted: #5f5a52; --hover: #f0ece3; --focus: #2f6b47;
+    --brand: #1f3d2d; --brand-text: #f4f1ea; --brand-line: #4f6e5c;
+    --accent: #2f6b47; --accent-hover: #275a3b;
+    --ok: #1d7a3a; --ok-bg: #e2f1e6; --warn: #8a5a00; --warn-bg: #faefd6;
+    --bad: #a12a2a; --bad-bg: #f8e2e2; --idle: #6f6a61; --idle-bg: #ebe8e1;
+    --term-bg: #151815; --term-text: #dad7cf; --term-muted: #8d897f; --term-warn: #e8c46a; --term-err: #ff9191;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 4px 14px rgba(0, 0, 0, 0.05);
+    --pop-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #121412; --surface: #1b1e1b; --surface-2: #202420; --border: #2d322d; --border-strong: #3e453e;
+      --text: #e8e5de; --muted: #a39e94; --hover: #262b26; --focus: #74cf93;
+      --brand: #17271e; --brand-text: #e8e5de; --brand-line: #3b5746;
+      --accent: #337a4f; --accent-hover: #3b8a5a;
+      --ok: #74cf93; --ok-bg: #1b3324; --warn: #e5b95c; --warn-bg: #362b14;
+      --bad: #f19090; --bad-bg: #3b1e1e; --idle: #a09b91; --idle-bg: #272b27;
+      --term-bg: #0d0f0d;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+      --pop-shadow: 0 10px 32px rgba(0, 0, 0, 0.55);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  button, input, select { font: inherit; color: inherit; }
+  button { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: 7px; padding: 0.3rem 0.75rem; cursor: pointer; line-height: 1.35; }
+  button:hover:not(:disabled) { background: var(--hover); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .primary, .row-actions button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .primary:hover:not(:disabled), .row-actions button[type="submit"]:hover:not(:disabled) { background: var(--accent-hover); }
+  .danger { color: var(--bad); }
+  .row-actions button.danger[type="submit"] { background: var(--bad); border-color: var(--bad); color: #fff; }
+  input[type="text"], input[type="search"], input[type="number"], select { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 7px; padding: 0.35rem 0.6rem; }
+  .muted { color: var(--muted); font-size: 0.9rem; }
+
+  header { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: center; background: var(--brand); color: var(--brand-text); padding: 0.65rem 1.25rem; }
+  header h1 { margin: 0; font-size: 1.1rem; font-weight: 650; display: flex; align-items: center; gap: 0.5rem; }
+  header h1 img { border-radius: 5px; }
+  .header-end { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.6rem; }
+  .pill { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; padding: 0.22rem 0.65rem; border-radius: 999px; background: rgba(255, 255, 255, 0.08); white-space: nowrap; }
+  .pill b { font-weight: 600; }
+  .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: #e46a6a; flex: none; }
+  .dot.on { background: #48d27a; }
   .menu { position: relative; }
-  .menu summary { list-style: none; cursor: pointer; border: 1px solid #8eaa98; padding: 0.25rem 0.55rem; color: #f4f1ea; user-select: none; }
+  .menu summary { list-style: none; cursor: pointer; border: 1px solid var(--brand-line); border-radius: 7px; padding: 0.3rem 0.75rem; user-select: none; }
+  .menu summary:hover { background: rgba(255, 255, 255, 0.08); }
   .menu summary::-webkit-details-marker { display: none; }
   .menu summary::after { content: " \25BE"; font-size: 0.8em; }
-  .menu-panel { position: absolute; right: 0; top: calc(100% + 0.35rem); z-index: 5; display: flex; flex-direction: column; gap: 0.25rem; min-width: 12rem; background: #1f3d2d; border: 1px solid #8eaa98; padding: 0.35rem; }
-  .menu-panel button { text-align: left; }
-  main { padding: 1rem; max-width: 72rem; margin: 0 auto; }
-  h2 { font-size: 1rem; margin: 1.2rem 0 0.4rem; }
-  table { width: 100%; border-collapse: collapse; background: #fff; }
-  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #e4dfd4; vertical-align: top; }
-  th { font-size: 0.75rem; letter-spacing: 0.04em; color: #555; }
-  .status { font-weight: 600; }
-  .stopped { color: #8d1d1d; }
-  .starting { color: #8a5a00; }
-  .running { color: #1d7a3a; }
-  .error { color: #9a3412; }
-  .java-warn { color: #9a3412; font-weight: 600; }
-  .port-warn { color: #9a3412; font-size: 0.8rem; margin-top: 0.25rem; max-width: 12rem; }
-  .port-warn:empty { display: none; }
-  .actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
-  .actions input[type="number"] { width: 5.5rem; font: inherit; padding: 0.2rem; }
-  tr.busy { color: #8a8478; }
-  tr.busy .status { color: #8a8478; }
-  tr.busy button, tr.busy input { opacity: 0.45; }
-  .loadbar { flex: 1 0 100%; height: 0.3rem; background: #e4dfd4; overflow: hidden; border-radius: 999px; }
+  .menu-panel { position: absolute; right: 0; top: calc(100% + 0.4rem); z-index: 5; display: flex; flex-direction: column; min-width: 13rem; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--pop-shadow); padding: 0.3rem; }
+  .menu-panel button, .pop button { border: 0; background: transparent; text-align: left; border-radius: 6px; padding: 0.45rem 0.65rem; white-space: nowrap; }
+  .menu-panel button:hover, .pop button:hover, .pop button:focus { background: var(--hover); outline: none; }
+  .pop hr, .menu-panel hr { border: 0; border-top: 1px solid var(--border); margin: 0.25rem 0.2rem; }
+
+  main { padding: 1.25rem; max-width: 76rem; margin: 0 auto; display: grid; gap: 1.5rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+  .section-head { display: flex; align-items: center; gap: 0.75rem; }
+  .section-head h2 { margin: 0; font-size: 1.05rem; font-weight: 650; }
+  .section-head .primary { margin-left: auto; }
+  .group-title { display: flex; align-items: center; gap: 0.45rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 650; margin: 1.1rem 0 0.45rem; }
+  .count { font-size: 0.72rem; background: var(--idle-bg); color: var(--muted); border-radius: 999px; padding: 0 0.45rem; letter-spacing: 0; }
+  .empty { padding: 1.25rem; color: var(--muted); }
+
+  .table-card { overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; background: var(--surface-2); padding: 0.5rem 0.85rem; border-bottom: 1px solid var(--border); }
+  td { padding: 0.65rem 0.85rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--surface-2); }
+  .name { font-weight: 600; overflow-wrap: anywhere; }
+  .meta { font-size: 0.82rem; color: var(--muted); }
+  .warn-text { font-size: 0.8rem; color: var(--warn); margin-top: 0.15rem; }
+  .warn-text:empty { display: none; }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .badge { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; font-weight: 600; padding: 0.12rem 0.6rem; border-radius: 999px; background: var(--idle-bg); color: var(--idle); white-space: nowrap; }
+  .badge::before { content: ""; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: currentColor; }
+  .badge.running { background: var(--ok-bg); color: var(--ok); }
+  .badge.starting { background: var(--warn-bg); color: var(--warn); }
+  .badge.error { background: var(--bad-bg); color: var(--bad); }
+  .badge.starting::before { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+  td.actions { width: 1%; }
+  .actions-inner { display: flex; gap: 0.35rem; justify-content: flex-end; align-items: center; }
+  .actions-inner button { white-space: nowrap; }
+  .more { padding-left: 0.6rem; padding-right: 0.6rem; font-weight: 700; letter-spacing: 0.05em; }
+  tr.busy td { color: var(--muted); }
+  tr.busy .badge { opacity: 0.6; }
+  .loadbar { display: block; margin-top: 0.4rem; height: 0.25rem; background: var(--border); overflow: hidden; border-radius: 999px; }
   .loadbar[hidden] { display: none; }
-  .loadbar span { display: block; height: 100%; width: 35%; background: #6d7a72; animation: loadbar 1s ease-in-out infinite; }
+  .loadbar span { display: block; height: 100%; width: 35%; background: var(--accent); animation: loadbar 1s ease-in-out infinite; }
   @keyframes loadbar { from { transform: translateX(-120%); } to { transform: translateX(320%); } }
-  .danger { color: #8d1d1d; border-color: #e0b4b4; }
-  .console-head { display: flex; align-items: center; gap: 0.45rem; margin: 1.2rem 0 0.4rem; }
-  .console-head h2 { margin: 0; }
-  .spinner { width: 0.9rem; height: 0.9rem; border: 2px solid #c8c2b4; border-top-color: #1f3d2d; border-radius: 50%; animation: spin 0.7s linear infinite; }
+
+  .console-panel { padding: 0.9rem; display: flex; flex-direction: column; gap: 0.55rem; min-width: 0; }
+  .console-head { display: flex; align-items: center; gap: 0.5rem; }
+  .console-head h2 { margin: 0; font-size: 1.05rem; font-weight: 650; }
+  .spinner { width: 0.9rem; height: 0.9rem; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; flex: none; }
   .spinner[hidden] { display: none; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .console-form { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.4rem 0; }
-  .console-form[hidden] { display: none; }
-  .console-form select, .console-form input { font: inherit; padding: 0.3rem; }
-  .console-form input { flex: 1; min-width: 12rem; }
+  .console-form { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+  .console-form input { flex: 1; min-width: 10rem; }
+  #console-msg { margin: 0; }
+  #console-msg:empty { display: none; }
+  .term { position: relative; flex: 1; min-height: 0; display: flex; }
+  #out { flex: 1; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--term-bg); color: var(--term-text); font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace; padding: 0.75rem 0.9rem; border-radius: 8px; min-height: 14rem; max-height: 30rem; overflow: auto; }
+  #out:empty::before { content: attr(data-empty); color: var(--term-muted); font-family: system-ui, sans-serif; }
+  #out .lw { color: var(--term-warn); }
+  #out .le { color: var(--term-err); }
+  .jump { position: absolute; right: 0.9rem; bottom: 0.75rem; border: 0; border-radius: 999px; background: var(--accent); color: #fff; font-size: 0.8rem; font-weight: 600; padding: 0.3rem 0.8rem; box-shadow: var(--pop-shadow); }
+  .jump:hover:not(:disabled) { background: var(--accent-hover); }
+  .jump[hidden] { display: none; }
+
   .pick { position: relative; }
-  .pick-btn { font: inherit; background: #fff; color: #1c1c1c; border: 1px solid #c8c2b4; padding: 0.3rem 0.55rem; cursor: pointer; min-width: 10rem; text-align: left; }
+  .pick-btn { background: var(--surface); border: 1px solid var(--border-strong); padding: 0.35rem 0.65rem; min-width: 11rem; text-align: left; }
   .pick-btn::after { content: " \25BE"; float: right; margin-left: 0.6rem; }
-  .pick-btn:disabled { opacity: 0.6; cursor: default; }
-  .pick-menu { position: absolute; left: 0; top: calc(100% + 0.2rem); z-index: 6; min-width: 100%; max-height: 16rem; overflow-y: auto; background: #fff; border: 1px solid #c8c2b4; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); display: flex; flex-direction: column; }
-  .pick-menu[hidden] { display: none; }
-  .pick-menu button { font: inherit; text-align: left; background: #fff; color: #1c1c1c; border: 0; padding: 0.35rem 0.6rem; cursor: pointer; white-space: nowrap; }
-  .pick-menu button:hover, .pick-menu button:focus { background: #ece7dc; outline: none; }
+  .pick-menu, .pop { position: absolute; z-index: 6; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--pop-shadow); display: flex; flex-direction: column; padding: 0.3rem; }
+  .pick-menu { left: 0; top: calc(100% + 0.25rem); min-width: 100%; max-height: 16rem; overflow-y: auto; }
+  .pick-menu[hidden], .pop[hidden] { display: none; }
+  .pick-menu button { border: 0; background: transparent; text-align: left; border-radius: 6px; padding: 0.4rem 0.65rem; white-space: nowrap; }
+  .pick-menu button:hover, .pick-menu button:focus { background: var(--hover); outline: none; }
   .pick-menu button[aria-selected="true"] { font-weight: 600; }
-  .props-menu { position: absolute; top: 0; left: 0; min-width: 16rem; max-width: min(28rem, calc(100vw - 2rem)); }
-  .props-menu input { font: inherit; margin: 0.35rem; padding: 0.25rem 0.4rem; border: 1px solid #c8c2b4; }
+  .pop { top: 0; left: 0; min-width: 12rem; }
+  .pop .danger { color: var(--bad); }
+  .props-menu { min-width: 16rem; max-width: min(28rem, calc(100vw - 2rem)); }
+  .props-menu input { margin: 0.2rem 0.2rem 0.35rem; }
   .props-menu .props-list { overflow-y: auto; max-height: 14rem; display: flex; flex-direction: column; }
-  .props-menu button { display: flex; gap: 0.8rem; justify-content: space-between; }
-  .props-menu .props-val { color: #555; overflow: hidden; text-overflow: ellipsis; max-width: 12rem; }
+  .props-menu .props-list button { display: flex; gap: 0.8rem; justify-content: space-between; }
+  .props-menu .props-val { color: var(--muted); overflow: hidden; text-overflow: ellipsis; max-width: 12rem; }
   .props-menu p { margin: 0.4rem 0.6rem; }
-  #out { white-space: pre-wrap; background: #1c1c1c; color: #f3f0e8; padding: 0.8rem; min-height: 2.5rem; max-height: 24rem; overflow: auto; }
-  dialog { border: 1px solid #ccc; padding: 1rem; max-width: 28rem; }
-  dialog label { display: block; margin: 0.5rem 0; }
+
+  dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: var(--pop-shadow); padding: 1.25rem; width: min(30rem, calc(100vw - 2rem)); }
+  dialog::backdrop { background: rgba(10, 14, 10, 0.45); }
+  dialog p { margin: 0 0 0.75rem; }
+  dialog label { display: block; margin: 0.6rem 0; }
   dialog [hidden] { display: none; }
-  dialog input[type="text"], dialog input[type="search"] { font: inherit; padding: 0.3rem; width: 100%; box-sizing: border-box; }
-  .results { list-style: none; padding: 0; margin: 0.4rem 0; max-height: 12rem; overflow: auto; }
-  .results button { display: block; width: 100%; text-align: left; margin-bottom: 0.25rem; }
-  .results button.on { outline: 2px solid #1f3d2d; }
-  .muted { color: #555; font-size: 0.9rem; }
-  .upd-check { padding: 0.45rem 0.6rem; background: #f3f0e8; border-left: 3px solid #6d7a72; }
-  .upd-check.warn { border-left-color: #9a3412; color: #7c2d12; }
-  .row-actions { display: flex; gap: 0.4rem; justify-content: flex-end; margin-top: 0.8rem; }
-  .svc-state { display: inline-flex; align-items: center; gap: 0.35rem; }
-  .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: #e15d5d; }
-  .dot.on { background: #3dce6e; }
+  dialog input[type="text"], dialog input[type="search"], dialog input[type="number"], dialog select { width: 100%; margin-top: 0.25rem; }
+  .dlg-msg { color: var(--bad); }
+  .dlg-msg:empty { display: none; }
+  .dlg-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.9rem; }
+  .dlg-head h2 { margin: 0; font-size: 1.1rem; }
+  .dlg-head button { margin-left: auto; border: 0; background: transparent; font-size: 1.3rem; line-height: 1; padding: 0.2rem 0.45rem; }
+  #install-dlg { width: min(38rem, calc(100vw - 2rem)); }
+  #search-form { display: flex; gap: 0.4rem; }
+  #search-q { flex: 1; min-width: 0; }
+  #search-msg { margin: 0.6rem 0 0; }
+  #search-msg:empty { display: none; }
+  .results { list-style: none; padding: 0; margin: 0.6rem 0 0; max-height: min(24rem, 55vh); overflow: auto; display: flex; flex-direction: column; gap: 0.4rem; }
+  .results:empty { display: none; }
+  .results button { display: block; width: 100%; text-align: left; padding: 0.55rem 0.75rem; }
+  .results button.on { outline: 2px solid var(--accent); }
+  .upd-check { padding: 0.5rem 0.7rem; background: var(--surface-2); border-left: 3px solid var(--idle); border-radius: 0 6px 6px 0; }
+  .upd-check.warn { border-left-color: var(--warn); color: var(--warn); }
+  .row-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
 
-  /* Phones: each server becomes a card with labelled lines, and controls get
-     finger-sized. Inputs use 16px so iOS does not zoom in on focus. */
+  .toasts { position: fixed; right: 1rem; bottom: 1rem; z-index: 20; display: flex; flex-direction: column; gap: 0.5rem; width: min(24rem, calc(100vw - 2rem)); pointer-events: none; }
+  .toast { pointer-events: auto; display: grid; grid-template-columns: auto 1fr auto; gap: 0.2rem 0.6rem; align-items: start; background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--idle); border-radius: 8px; box-shadow: var(--pop-shadow); padding: 0.6rem 0.5rem 0.6rem 0.75rem; animation: toast-in 0.18s ease-out; }
+  .toast[data-kind="ok"] { border-left-color: var(--ok); }
+  .toast[data-kind="error"] { border-left-color: var(--bad); }
+  .toast[data-kind="busy"] { border-left-color: var(--accent); }
+  .toast-icon { width: 1rem; height: 1rem; margin-top: 0.15rem; border-radius: 50%; display: grid; place-items: center; font-size: 0.7rem; font-weight: 700; color: #fff; }
+  .toast[data-kind="ok"] .toast-icon { background: var(--ok); }
+  .toast[data-kind="ok"] .toast-icon::before { content: "\2713"; }
+  .toast[data-kind="error"] .toast-icon { background: var(--bad); }
+  .toast[data-kind="error"] .toast-icon::before { content: "!"; }
+  .toast[data-kind="busy"] .toast-icon { border: 2px solid var(--border-strong); border-top-color: var(--accent); animation: spin 0.7s linear infinite; }
+  .toast-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.88rem; max-height: 7.5em; overflow: hidden; }
+  .toast.open .toast-body { max-height: 40vh; overflow: auto; }
+  .toast-x { border: 0; background: transparent; padding: 0 0.35rem; font-size: 1.1rem; line-height: 1.2; color: var(--muted); }
+  .toast-more { grid-column: 2; justify-self: start; border: 0; background: transparent; padding: 0; font-size: 0.8rem; color: var(--accent); font-weight: 600; }
+  .toast-more[hidden] { display: none; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(0.5rem); } }
+
+  @media (prefers-reduced-motion: reduce) {
+    .badge.starting::before, .toast { animation: none; }
+  }
+
+  /* Wide screens: servers on the left, the console beside them so a log is
+     always in view. */
+  @media (min-width: 75rem) {
+    main { max-width: 112rem; grid-template-columns: minmax(0, 1fr) minmax(28rem, 38rem); align-items: start; }
+    .console-panel { position: sticky; top: 1rem; height: calc(100vh - 2rem); }
+    #out { max-height: none; }
+  }
+
+  /* Phones: each server becomes a card, and controls get finger-sized.
+     Inputs use 16px so iOS does not zoom in on focus. */
   @media (max-width: 40rem) {
-    main { padding: 0.75rem; }
-    header { padding: 0.7rem 0.75rem; }
-    header button, .menu summary { min-height: 2.5rem; padding: 0.4rem 0.7rem; box-sizing: border-box; }
-    .header-end { gap: 0.5rem 0.75rem; }
+    main { padding: 0.75rem; gap: 1.1rem; }
+    header { padding: 0.6rem 0.75rem; }
+    .header-end { margin-left: 0; width: 100%; }
+    .menu summary { min-height: 2.5rem; display: flex; align-items: center; }
     .menu-panel button { min-height: 2.75rem; }
+    #page-menu .menu-panel { right: 0; }
+    #svc-menu .menu-panel { right: auto; left: 0; }
     button, .pick-btn { min-height: 2.75rem; }
-    input, select { font-size: 16px; min-height: 2.75rem; box-sizing: border-box; }
+    input, select { font-size: 16px; min-height: 2.75rem; }
 
-    #search-form { display: flex; flex-wrap: wrap; gap: 0.4rem; }
-    #search-q { flex: 1 1 100%; padding: 0.4rem; }
-    #search-form button { flex: 1; }
-    .results button { padding: 0.5rem; }
-
+    .table-card { background: none; border: 0; box-shadow: none; overflow: visible; }
     #packs table, #packs tbody, #packs tr, #packs td { display: block; }
-    #packs table { background: none; }
     #packs thead { display: none; }
-    #packs tr { background: #fff; border: 1px solid #e4dfd4; margin-bottom: 0.75rem; padding: 0.4rem 0; }
-    #packs td { border: 0; padding: 0.3rem 0.75rem; }
-    #packs td[data-label] { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
-    #packs td[data-label]::before { content: attr(data-label); flex: 0 0 4.5rem; font-size: 0.75rem; letter-spacing: 0.04em; color: #555; font-weight: 400; }
-    #packs td[data-pack-name] { font-size: 1.05rem; font-weight: 600; padding-top: 0.2rem; overflow-wrap: anywhere; }
-    #packs .actions input[type="number"], #packs td[data-label="Port"] input { width: 7rem; }
-    #packs .port-warn { flex: 1 0 100%; max-width: none; margin: 0; }
-    #packs td.actions { display: grid; grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr)); gap: 0.4rem; padding-top: 0.5rem; }
-    #packs .loadbar { grid-column: 1 / -1; }
+    #packs tr { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 0.65rem; padding: 0.65rem 0.8rem; }
+    #packs tbody tr:hover { background: var(--surface); }
+    #packs td { border: 0; padding: 0; }
+    #packs td[data-label="Status"] { display: inline-block; margin: 0.45rem 0.8rem 0 0; }
+    #packs td.stat { display: inline-block; margin: 0.45rem 0.8rem 0 0; font-size: 0.88rem; }
+    #packs td.stat::before { content: attr(data-label) " "; color: var(--muted); font-size: 0.75rem; }
+    #packs td.actions { width: auto; padding-top: 0.65rem; }
+    .actions-inner { display: grid; grid-template-columns: 1fr 1fr 3.25rem; }
 
     .console-form .pick { flex: 1 1 100%; }
     .console-form .pick-btn { width: 100%; }
     .console-form input { min-width: 0; }
-    .pick-menu button { padding: 0.6rem 0.75rem; }
-    #out { max-height: 60vh; font-size: 13px; padding: 0.6rem; }
-
+    .pick-menu button, .pop button { padding: 0.65rem 0.75rem; }
+    #out { min-height: 12rem; max-height: 60vh; font-size: 12px; padding: 0.6rem; }
     .props-menu { min-width: 0; width: calc(100vw - 1.5rem); }
     .props-menu .props-list { max-height: 50vh; }
-    .props-menu button { padding: 0.6rem 0.75rem; }
     .props-menu .props-val { max-width: 45%; }
-    dialog { width: calc(100vw - 2rem); box-sizing: border-box; }
     .row-actions button { flex: 1; }
+    .toasts { right: 0.75rem; left: 0.75rem; bottom: 0.75rem; width: auto; }
   }
 </style>
 </head>
 <body>
 <header>
-  <h1>modman</h1>
+  <h1><img src="/favicon.svg" alt="" width="22" height="22"> modman</h1>
   <div class="header-end">
-    <span class="svc-state">Service <span id="svc-dot" class="dot" role="img" aria-label="unknown"></span></span>
-    <span class="svc-state">Boot <span id="boot-dot" class="dot" role="img" aria-label="unknown"></span></span>
+    <span class="pill" title="The boot service starts and stops the Active servers together"><span id="svc-dot" class="dot" role="img" aria-label="unknown"></span>Service <b id="svc-text">unknown</b></span>
+    <span class="pill" title="Whether the boot service starts the Active servers when this machine boots"><span id="boot-dot" class="dot" role="img" aria-label="unknown"></span>Start at boot <b id="boot-text">unknown</b></span>
     <details class="menu" id="svc-menu">
       <summary>Service</summary>
       <div class="menu-panel">
         <button type="button" id="svc-start">Start service</button>
         <button type="button" id="svc-stop">Stop service</button>
         <button type="button" id="svc-restart">Restart service</button>
-        <button type="button" id="svc-enable">Enable at boot</button>
-        <button type="button" id="svc-disable">Disable at boot</button>
+        <hr>
+        <button type="button" id="svc-enable">Start at boot</button>
+        <button type="button" id="svc-disable">Don't start at boot</button>
       </div>
     </details>
-    <button type="button" id="unlock" title="Cancel pending requests and re-enable every greyed-out control">Unlock</button>
-    <button type="button" id="logout">Sign out</button>
+    <details class="menu" id="page-menu">
+      <summary>Menu</summary>
+      <div class="menu-panel">
+        <button type="button" id="unlock" title="Cancel pending requests and re-enable every greyed-out control">Unlock page</button>
+        <button type="button" id="logout">Sign out</button>
+      </div>
+    </details>
   </div>
 </header>
 <main>
-  <section class="tools">
-    <h2>Install a modpack</h2>
-    <form id="search-form">
-      <input id="search-q" type="search" placeholder="Search CurseForge" required>
-      <button type="submit">Search</button>
-      <button type="button" id="search-clear">Clear</button>
-    </form>
-    <ul id="search-results" class="results"></ul>
-  </section>
-  <div id="packs"></div>
-  <div class="console-head">
-    <h2>Console</h2>
-    <span id="console-spin" class="spinner" hidden role="status" aria-label="Loading"></span>
-  </div>
-  <form id="console-form" class="console-form">
-    <div class="pick">
-      <select id="console-pack" aria-label="Modpack" hidden>
-        <option value="">Actions</option>
-      </select>
-      <button type="button" id="console-pick-btn" class="pick-btn" aria-haspopup="listbox" aria-expanded="false">Actions</button>
-      <div id="console-pick-menu" class="pick-menu" role="listbox" aria-label="Modpack" hidden></div>
+  <section class="servers" aria-labelledby="servers-title">
+    <div class="section-head">
+      <h2 id="servers-title">Servers</h2>
+      <button type="button" id="install-open" class="primary">+ Install modpack</button>
     </div>
-    <input id="console-cmd" type="text" maxlength="300" placeholder="Command" autocomplete="off">
-    <button type="submit">Send</button>
-  </form>
-  <p id="console-msg" class="muted"></p>
-  <pre id="out"></pre>
+    <div id="packs"></div>
+  </section>
+  <section class="console-panel card" aria-labelledby="console-title">
+    <div class="console-head">
+      <h2 id="console-title">Console</h2>
+      <span id="console-spin" class="spinner" hidden role="status" aria-label="Loading"></span>
+    </div>
+    <form id="console-form" class="console-form">
+      <div class="pick">
+        <select id="console-pack" aria-label="Server" hidden>
+          <option value="">Choose a server</option>
+        </select>
+        <button type="button" id="console-pick-btn" class="pick-btn" aria-haspopup="listbox" aria-expanded="false">Choose a server</button>
+        <div id="console-pick-menu" class="pick-menu" role="listbox" aria-label="Server" hidden></div>
+      </div>
+      <input id="console-cmd" type="text" maxlength="300" placeholder="Command (↑ for history)" autocomplete="off" aria-label="Command">
+      <button type="submit" class="primary">Send</button>
+    </form>
+    <p id="console-msg" class="muted"></p>
+    <div class="term">
+      <pre id="out" tabindex="0" aria-label="Server log" data-empty="No server selected. Press Log on a server, or choose a running one above."></pre>
+      <button type="button" id="jump" class="jump" hidden>&#8595; Latest</button>
+    </div>
+  </section>
   <script>
   (function () {
     try {
@@ -595,7 +725,21 @@ APP_PAGE = r"""<!DOCTYPE html>
   </script>
 </main>
 <dialog id="dlg"></dialog>
-<div id="props-menu" class="pick-menu props-menu" role="menu" aria-label="server.properties" hidden></div>
+<dialog id="install-dlg" aria-labelledby="install-title">
+  <div class="dlg-head">
+    <h2 id="install-title">Install a modpack</h2>
+    <button type="button" id="install-close" aria-label="Close">&times;</button>
+  </div>
+  <form id="search-form">
+    <input id="search-q" type="search" placeholder="Search CurseForge" aria-label="Search CurseForge" required>
+    <button type="submit" class="primary">Search</button>
+  </form>
+  <p id="search-msg" class="muted"></p>
+  <ul id="search-results" class="results"></ul>
+</dialog>
+<div id="row-menu" class="pop" role="menu" hidden></div>
+<div id="props-menu" class="pop props-menu" role="menu" aria-label="server.properties" hidden></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
 <script>
 const out = document.getElementById("out");
 const dlg = document.getElementById("dlg");
@@ -612,6 +756,10 @@ let actionText = "";
 let consoleOffset = 0;
 let consoleBusy = false;
 let consoleTicket = 0;
+let consoleText = "";
+let packsLoaded = false;
+let packsNote = null;
+const jumpBtn = document.getElementById("jump");
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -700,19 +848,22 @@ function clearBusy() {
   logBusy = false;
   consoleTicket++;
   closeProps();
+  closeRowMenu();
   setServerBusy(null, false);
   setConsoleBusy(false);
   setCommandEnabled(!!consoleName && runningPacks().some((p) => p.name === consoleName));
 }
 
-function show(text) {
+// Puts fixed text in the console, such as a stopped server's last log, and
+// stops following a server.
+function showStatic(text) {
   actionText = text || "";
   consoleName = "";
   consoleOffset = 0;
   const sel = document.getElementById("console-pack");
   if ([...sel.options].some((opt) => opt.value === "")) sel.value = "";
   syncPick();
-  out.textContent = actionText;
+  setConsoleText(actionText);
   if (!consoleBusy) {
     document.getElementById("console-cmd").disabled = true;
     document.querySelector("#console-form button[type=submit]").disabled = true;
@@ -720,8 +871,112 @@ function show(text) {
   saveState();
 }
 
+// Minecraft log lines carry their level as "[thread/LEVEL]". Lines after an
+// error that do not start a new entry, such as a stack trace, keep its color.
+const LOG_LEVEL_RE = /\/(WARN|WARNING|ERROR|FATAL|SEVERE)\]/;
+
+function setConsoleText(text) {
+  consoleText = text;
+  if (!text) {
+    out.replaceChildren();
+    jumpBtn.hidden = true;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  const lines = text.split("\n");
+  let inError = false;
+  lines.forEach((line, i) => {
+    const level = LOG_LEVEL_RE.exec(line);
+    let cls = "";
+    if (level) {
+      cls = level[1].startsWith("WARN") ? "lw" : "le";
+      inError = cls === "le";
+    } else if (line.startsWith("[")) {
+      inError = false;
+    } else if (inError && line) {
+      cls = "le";
+    }
+    const span = document.createElement("span");
+    if (cls) span.className = cls;
+    span.textContent = i < lines.length - 1 ? line + "\n" : line;
+    frag.appendChild(span);
+  });
+  out.replaceChildren(frag);
+}
+
+function consoleAtBottom() {
+  return out.scrollHeight - out.scrollTop - out.clientHeight < 48;
+}
+
+out.addEventListener("scroll", () => {
+  if (consoleAtBottom()) jumpBtn.hidden = true;
+});
+jumpBtn.onclick = () => {
+  out.scrollTop = out.scrollHeight;
+  jumpBtn.hidden = true;
+};
+
+// Action results show as notes in the corner, so the console keeps its log.
+// A busy note stays until updated. A done note fades after a while unless
+// the pointer is on it, and an error stays until closed.
+const toastBox = document.getElementById("toasts");
+
+function toast(text, kind) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  const icon = document.createElement("span");
+  icon.className = "toast-icon";
+  icon.setAttribute("aria-hidden", "true");
+  const body = document.createElement("div");
+  body.className = "toast-body";
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "toast-x";
+  x.setAttribute("aria-label", "Dismiss");
+  x.textContent = "×";
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "toast-more";
+  el.append(icon, body, x, more);
+  let timer = 0;
+  let current = kind;
+  const close = () => {
+    clearTimeout(timer);
+    el.remove();
+  };
+  const arm = () => {
+    clearTimeout(timer);
+    if (current === "ok") timer = setTimeout(close, 7000);
+  };
+  const update = (nextText, nextKind) => {
+    current = nextKind;
+    el.dataset.kind = nextKind;
+    el.setAttribute("role", nextKind === "error" ? "alert" : "status");
+    body.textContent = String(nextText || "").trim();
+    const long = body.textContent.split("\n").length > 5 || body.textContent.length > 280;
+    more.hidden = !long;
+    el.classList.remove("open");
+    more.textContent = "Show all";
+    arm();
+  };
+  x.onclick = close;
+  more.onclick = () => {
+    const open = el.classList.toggle("open");
+    more.textContent = open ? "Show less" : "Show all";
+  };
+  el.addEventListener("pointerenter", () => clearTimeout(timer));
+  el.addEventListener("pointerleave", arm);
+  update(text, kind);
+  toastBox.appendChild(el);
+  // Keep the corner tidy: drop the oldest finished notes past four.
+  const done = [...toastBox.children].filter((t) => t.dataset.kind !== "busy");
+  while (toastBox.children.length > 4 && done.length) done.shift().remove();
+  return {update, close, isOpen: () => el.isConnected};
+}
+
 function setServerBusy(name, on) {
   rowBusy = on;
+  if (on) closeRowMenu();
   document.querySelectorAll("#packs tr").forEach((tr) => {
     const mine = on && tr.dataset.name === name;
     tr.classList.toggle("busy", mine);
@@ -736,20 +991,23 @@ async function finishServer(name, label, request) {
   hold = true;
   if (name) setServerBusy(name, true);
   else rowBusy = true;
-  show(label || "Working…");
+  const note = toast(label || "Working…", "busy");
   let reached = false;
   try {
     const data = await request();
     reached = true;
-    if (!data) return;
-    show(data.output || (data.ok ? "Done." : "Failed."));
+    if (!data) {
+      note.close();
+      return;
+    }
+    note.update(data.output || (data.ok ? "Done." : "Failed."), data.ok === false ? "error" : "ok");
     return data;
   } catch (err) {
-    show(err instanceof ApiTimeout
+    note.update(err instanceof ApiTimeout
       ? "The server did not answer in time. Check the server list for the result."
       : err && err.name === "AbortError"
         ? "Cancelled. The server may still finish the action; check the server list."
-        : "The page could not reach the server.");
+        : "The page could not reach the server.", "error");
   } finally {
     // Keep the row busy until the list shows the result of the action. If the
     // server could not be reached, release the row now rather than waiting on
@@ -791,10 +1049,10 @@ function ask(html, onok) {
   };
 }
 
-function service(action, label) {
-  if (action === "stop" || action === "restart") {
+function service(action, label, question) {
+  if (question) {
     ask(
-      `<form><p>${esc(label)}</p><div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Continue</button></div></form>`,
+      `<form><p>${esc(question)}</p><div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Continue</button></div></form>`,
       () => { dlg.close(); run({cmd: "service", action}, label); }
     );
     return;
@@ -803,22 +1061,24 @@ function service(action, label) {
 }
 
 document.getElementById("svc-start").onclick = () => service("start", "Starting the boot service…");
-document.getElementById("svc-stop").onclick = () => service("stop", "Stop every indexed server and the boot service?");
-document.getElementById("svc-restart").onclick = () => service("restart", "Restart every indexed server through the boot service?");
-document.getElementById("svc-enable").onclick = () => service("enable", "Enabling the boot service…");
-document.getElementById("svc-disable").onclick = () => service("disable", "Disabling the boot service…");
+document.getElementById("svc-stop").onclick = () => service("stop", "Stopping the boot service…",
+  "Stop every Active server and the boot service?");
+document.getElementById("svc-restart").onclick = () => service("restart", "Restarting the boot service…",
+  "Restart every Active server through the boot service?");
+document.getElementById("svc-enable").onclick = () => service("enable", "Turning on start at boot…");
+document.getElementById("svc-disable").onclick = () => service("disable", "Turning off start at boot…");
 document.getElementById("logout").onclick = async () => {
   await fetch("/logout", {method: "POST"});
   location.href = "/login";
 };
 document.addEventListener("click", (ev) => {
-  const menu = document.getElementById("svc-menu");
-  if (!menu.open) return;
-  if (menu.contains(ev.target)) {
-    if (ev.target.closest("button")) menu.open = false;
-    return;
+  for (const menu of document.querySelectorAll("details.menu[open]")) {
+    if (menu.contains(ev.target)) {
+      if (ev.target.closest("button")) menu.open = false;
+      continue;
+    }
+    menu.open = false;
   }
-  menu.open = false;
 });
 
 // Java the pack needs is a minimum, except before Minecraft 1.17, which needs Java 8 exactly.
@@ -847,47 +1107,65 @@ function portWarning(pack) {
   return `Port ${pack.port} is also used by ${names.join(", ")}`;
 }
 
+// The one action a row shows as a button. The rest are in its ⋯ menu.
+function primaryAction(pack) {
+  if (!pack.indexed) return {act: "enable", label: "Enable", cls: "primary"};
+  if (pack.status === "running" || pack.status === "starting") return {act: "stop", label: "Stop", cls: ""};
+  if (pack.status === "error") return {act: "restart", label: "Restart", cls: "primary"};
+  return {act: "start", label: "Start", cls: "primary"};
+}
+
+function rowMenuItems(pack) {
+  const items = [];
+  if (pack.indexed) {
+    const main = primaryAction(pack).act;
+    const up = pack.status && pack.status !== "stopped";
+    if (up && main !== "restart") items.push(["restart", "Restart"]);
+    if (up && main !== "stop") items.push(["stop", "Stop"]);
+  }
+  items.push(["props", "Properties…"], ["port", "Change port…"], ["update", "Update…"]);
+  if (pack.indexed) items.push(["disable", "Disable (move to Installed)"]);
+  items.push("-", ["uninstall", "Uninstall…"]);
+  return items;
+}
+
+function metaText(pack) {
+  const port = pack.port && pack.port !== "-" ? pack.port : "none";
+  return `Java ${javaText(pack)} · Port ${port}`;
+}
+
 function row(pack) {
-  const port = pack.port === "-" ? "" : pack.port;
-  const indexBtn = pack.indexed
-    ? `<button type="button" data-act="disable">Disable</button>`
-    : `<button type="button" data-act="enable">Enable</button>`;
-  const runBtns = pack.indexed
-    ? `<button type="button" data-act="start">Start</button>
-      <button type="button" data-act="stop">Stop</button>
-      <button type="button" data-act="restart">Restart</button>`
-    : "";
+  const p = primaryAction(pack);
   // Installed packs are not started from the page, so they have no status or usage columns.
   const usage = pack.indexed
-    ? `<td class="status ${esc(pack.status)}" data-label="Status">${esc(pack.status)}</td>
-    <td data-cpu data-label="CPU">${esc(pack.cpu)}</td>
-    <td data-ram data-label="RAM">${esc(pack.ram)}</td>
-    <td data-uptime data-label="Uptime">${esc(pack.uptime)}</td>`
+    ? `<td data-label="Status"><span class="badge ${esc(pack.status)}" data-badge>${esc(pack.status)}</span></td>
+    <td class="num stat" data-cpu data-label="CPU">${esc(pack.cpu)}</td>
+    <td class="num stat" data-ram data-label="RAM">${esc(pack.ram)}</td>
+    <td class="num stat" data-uptime data-label="Up">${esc(pack.uptime)}</td>`
     : "";
-  return `<tr data-name="${esc(pack.name)}">
-    <td data-pack-name>${esc(pack.name)}</td>
-    <td class="${javaWarning(pack) ? "java-warn" : ""}" data-label="Java" title="${esc(javaWarning(pack))}">${esc(javaText(pack))}</td>
-    <td data-label="Port"><input type="number" min="1" max="65535" value="${esc(port)}" data-port> <button type="button" data-act="port">Set</button>
-      <div class="port-warn" data-port-warn>${esc(portWarning(pack))}</div></td>
-    ${usage}
-    <td class="actions">
-      ${runBtns}
-      ${indexBtn}
-      <button type="button" data-act="log">Log</button>
-      <button type="button" data-act="props" aria-haspopup="menu" title="Edit server.properties">Properties &#9662;</button>
-      <button type="button" data-act="update">Update</button>
-      <button type="button" class="danger" data-act="uninstall">Uninstall</button>
-      <span class="loadbar" hidden role="progressbar" aria-label="Working"><span></span></span>
+  return `<tr data-name="${esc(pack.name)}" data-indexed="${pack.indexed ? 1 : 0}">
+    <td data-pack-name>
+      <div class="name">${esc(pack.name)}</div>
+      <div class="meta" data-meta>${esc(metaText(pack))}</div>
+      <div class="warn-text" data-java-warn>${esc(javaWarning(pack))}</div>
+      <div class="warn-text" data-port-warn>${esc(portWarning(pack))}</div>
     </td>
+    ${usage}
+    <td class="actions"><div class="actions-inner">
+      <button type="button" data-act="${p.act}" data-primary class="${p.cls}">${p.label}</button>
+      <button type="button" data-act="log">Log</button>
+      <button type="button" class="more" data-act="more" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${esc(pack.name)}" title="More actions">&#8943;</button>
+    </div><span class="loadbar" hidden role="progressbar" aria-label="Working"><span></span></span></td>
   </tr>`;
 }
 
 function table(title, rows, usage) {
   if (!rows.length) return "";
   const usageHead = usage ? "<th>Status</th><th>CPU</th><th>RAM</th><th>Uptime</th>" : "";
-  return `<h2>${esc(title)}</h2><table>
-    <thead><tr><th>Modpack</th><th>Java</th><th>Port</th>${usageHead}<th></th></tr></thead>
-    <tbody>${rows.map(row).join("")}</tbody></table>`;
+  return `<h3 class="group-title">${esc(title)} <span class="count">${rows.length}</span></h3>
+    <div class="card table-card"><table>
+    <thead><tr><th>Server</th>${usageHead}<th><span hidden>Actions</span></th></tr></thead>
+    <tbody>${rows.map(row).join("")}</tbody></table></div>`;
 }
 
 function paintDot(id, good, label) {
@@ -896,19 +1174,39 @@ function paintDot(id, good, label) {
   el.classList.toggle("on", !!good);
   el.title = text;
   el.setAttribute("aria-label", text);
+  const word = document.getElementById(id.replace("-dot", "-text"));
+  if (word) word.textContent = text;
 }
 
 function render() {
+  closeRowMenu();
   const indexed = packs.filter((p) => p.indexed);
   const other = packs.filter((p) => !p.indexed);
-  document.getElementById("packs").innerHTML =
-    table("Active", indexed, true) + table("Installed", other, false);
+  const box = document.getElementById("packs");
+  if (!packs.length) {
+    box.innerHTML = `<div class="card empty">${packsLoaded
+      ? "No modpacks yet. Use Install modpack to add one."
+      : "Loading servers…"}</div>`;
+    return;
+  }
+  box.innerHTML = table("Active", indexed, true) + table("Installed", other, false);
+  // A properties menu open on a row follows the redrawn row's ⋯ button.
+  if (!propsMenu.hidden && propsAnchor && !propsAnchor.isConnected) {
+    propsAnchor = moreButton(propsMenu.dataset.name);
+    if (!propsAnchor) closeProps();
+    else placeMenu(propsMenu, propsAnchor);
+  }
+}
+
+function moreButton(name) {
+  const tr = document.querySelector(`#packs tr[data-name="${CSS.escape(name || "")}"]`);
+  return tr ? tr.querySelector('[data-act="more"]') : null;
 }
 
 function saveState() {
   try {
-    if (out.textContent === "Loading…") return;
-    const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 48;
+    if (!packsLoaded && !packs.length) return;
+    const stick = consoleAtBottom();
     localStorage.setItem("modman-page", JSON.stringify({
       packs,
       service: {
@@ -918,7 +1216,7 @@ function saveState() {
       consoleName,
       consoleOffset,
       actionText,
-      consoleText: out.textContent,
+      consoleText,
       packsHtml: document.getElementById("packs").innerHTML,
       consoleStick: stick,
       consoleScroll: out.scrollTop
@@ -950,47 +1248,47 @@ function restoreState() {
   const svc = saved.service || {};
   if (typeof svc.active === "string") paintDot("svc-dot", svc.active === "active", svc.active);
   if (typeof svc.enabled === "string") paintDot("boot-dot", svc.enabled === "enabled", svc.enabled);
-  out.textContent = typeof saved.consoleText === "string" ? saved.consoleText : actionText;
+  setConsoleText(typeof saved.consoleText === "string" ? saved.consoleText : actionText);
   if (saved.consoleStick) out.scrollTop = out.scrollHeight;
   else if (Number.isFinite(saved.consoleScroll)) out.scrollTop = saved.consoleScroll;
   return true;
+}
+
+function setText(el, text) {
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 function updateVisibleStatus() {
   for (const pack of packs) {
     const tr = document.querySelector(`#packs tr[data-name="${CSS.escape(pack.name)}"]`);
     if (!tr) continue;
-    const statusCell = tr.querySelector(".status");
-    const cells = tr.children;
-    if (statusCell) {
-      statusCell.className = `status ${pack.status}`;
-      statusCell.textContent = pack.status;
+    const badge = tr.querySelector("[data-badge]");
+    if (badge) {
+      const cls = `badge ${pack.status}`;
+      if (badge.className !== cls) badge.className = cls;
+      setText(badge, pack.status);
     }
-    cells[1].textContent = javaText(pack);
-    cells[1].className = javaWarning(pack) ? "java-warn" : "";
-    cells[1].title = javaWarning(pack);
-    const portInput = tr.querySelector("[data-port]");
-    if (portInput && document.activeElement !== portInput) {
-      const next = pack.port === "-" ? "" : String(pack.port);
-      if (portInput.value !== next) portInput.value = next;
-    }
-    const warn = tr.querySelector("[data-port-warn]");
-    if (warn) {
-      const text = portWarning(pack);
-      if (warn.textContent !== text) warn.textContent = text;
-    }
+    setText(tr.querySelector("[data-meta]"), metaText(pack));
+    setText(tr.querySelector("[data-java-warn]"), javaWarning(pack));
+    setText(tr.querySelector("[data-port-warn]"), portWarning(pack));
     for (const [attr, text] of [["data-cpu", pack.cpu], ["data-ram", pack.ram], ["data-uptime", pack.uptime]]) {
-      const cell = tr.querySelector(`[${attr}]`);
-      if (cell && cell.textContent !== text) cell.textContent = text;
+      setText(tr.querySelector(`[${attr}]`), text);
+    }
+    const main = tr.querySelector("[data-primary]");
+    const p = primaryAction(pack);
+    if (main && main.dataset.act !== p.act) {
+      main.dataset.act = p.act;
+      main.textContent = p.label;
+      main.className = p.cls;
     }
   }
 }
 
 function syncPacks() {
   const rows = [...document.querySelectorAll("#packs tr[data-name]")];
-  const same = rows.length === packs.length && rows.every((tr, i) => {
+  const same = packs.length > 0 && rows.length === packs.length && rows.every((tr, i) => {
     const pack = packs[i];
-    return tr.dataset.name === pack.name && !!tr.querySelector('[data-act="disable"]') === !!pack.indexed;
+    return tr.dataset.name === pack.name && tr.dataset.indexed === (pack.indexed ? "1" : "0");
   });
   if (!same) render();
   else updateVisibleStatus();
@@ -1043,7 +1341,7 @@ function fillPickMenu() {
 function syncPick() {
   const sel = document.getElementById("console-pack");
   const opt = sel.options[sel.selectedIndex];
-  const label = opt ? opt.textContent : "Actions";
+  const label = opt ? opt.textContent : "Choose a server";
   if (pickBtn.textContent !== label) pickBtn.textContent = label;
   if (pickOpen()) fillPickMenu();
 }
@@ -1103,7 +1401,7 @@ function consoleLabel(pack) {
 // Update the options in place, only when the names or labels changed.
 function fillPicker(list) {
   const sel = document.getElementById("console-pack");
-  const wanted = [["", "Actions"], ...list.map((p) => [p.name, consoleLabel(p)])];
+  const wanted = [["", "Choose a server"], ...list.map((p) => [p.name, consoleLabel(p)])];
   const same = wanted.length === sel.options.length &&
     wanted.every(([value, label], i) => sel.options[i].value === value && sel.options[i].textContent === label);
   if (!same) {
@@ -1132,14 +1430,14 @@ function fillConsolePacks() {
     // The server went down. Keep its last output on screen, such as a crash,
     // rather than jumping to another server's log.
     document.getElementById("console-msg").textContent = `${consoleName} is no longer running.`;
-    actionText = out.textContent;
+    actionText = consoleText;
     consoleName = "";
     consoleOffset = 0;
   }
   document.getElementById("console-pack").value = consoleName;
   syncPick();
   setCommandEnabled(!!consoleName);
-  if (!consoleName) out.textContent = actionText;
+  if (!consoleName && consoleText !== actionText) setConsoleText(actionText);
 }
 
 function trimConsole(text) {
@@ -1150,11 +1448,16 @@ function trimConsole(text) {
 }
 
 function showConsole(text, replace) {
-  const next = trimConsole(replace ? text : out.textContent + text);
-  if (next === out.textContent) return;
-  const nearBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 48;
-  out.textContent = next;
-  if (nearBottom || replace) out.scrollTop = out.scrollHeight;
+  const next = trimConsole(replace ? text : consoleText + text);
+  if (next === consoleText) return;
+  const nearBottom = consoleAtBottom();
+  setConsoleText(next);
+  if (nearBottom || replace) {
+    out.scrollTop = out.scrollHeight;
+    jumpBtn.hidden = true;
+  } else {
+    jumpBtn.hidden = false;
+  }
   saveState();
 }
 
@@ -1237,7 +1540,7 @@ document.getElementById("console-pack").onchange = () => {
   if (!name) {
     consoleName = "";
     consoleOffset = 0;
-    out.textContent = actionText;
+    setConsoleText(actionText);
     document.getElementById("console-msg").textContent = "";
     document.getElementById("console-cmd").disabled = true;
     document.querySelector("#console-form button[type=submit]").disabled = true;
@@ -1257,6 +1560,7 @@ document.getElementById("console-form").onsubmit = async (ev) => {
   if (name !== consoleName) consoleOffset = 0;
   consoleName = name;
   msg.textContent = "";
+  remember(command.trim());
   setConsoleBusy(true);
   try {
     const data = await api("/api/command", {name, command});
@@ -1268,9 +1572,46 @@ document.getElementById("console-form").onsubmit = async (ev) => {
     msg.textContent = "The page could not reach the server.";
   } finally {
     setConsoleBusy(false);
+    // Sending disabled the box, which drops focus. Put it back for the next command.
+    if (!input.disabled) input.focus();
   }
   setTimeout(refreshConsole, 500);
 };
+
+// Up and Down step through earlier commands, newest first, like a shell.
+// The list is kept in this browser only.
+const HISTORY_KEY = "modman-history";
+let cmdHistory = [];
+try {
+  const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+  if (Array.isArray(saved)) cmdHistory = saved.filter((c) => typeof c === "string").slice(-50);
+} catch (err) {}
+let historyPos = -1;
+let historyDraft = "";
+
+function remember(command) {
+  historyPos = -1;
+  if (cmdHistory[cmdHistory.length - 1] !== command) cmdHistory.push(command);
+  cmdHistory = cmdHistory.slice(-50);
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(cmdHistory)); } catch (err) {}
+}
+
+document.getElementById("console-cmd").addEventListener("keydown", (ev) => {
+  if (ev.key !== "ArrowUp" && ev.key !== "ArrowDown") return;
+  const input = ev.target;
+  if (ev.key === "ArrowUp") {
+    if (!cmdHistory.length || historyPos >= cmdHistory.length - 1) return;
+    if (historyPos === -1) historyDraft = input.value;
+    historyPos++;
+  } else {
+    if (historyPos === -1) return;
+    historyPos--;
+  }
+  ev.preventDefault();
+  input.value = historyPos === -1 ? historyDraft : cmdHistory[cmdHistory.length - 1 - historyPos];
+  input.setSelectionRange(input.value.length, input.value.length);
+});
+document.getElementById("console-cmd").addEventListener("input", () => { historyPos = -1; });
 
 // After an action, force skips the busy checks and replaces any poll still in
 // flight, whose list may predate the action.
@@ -1293,55 +1634,92 @@ async function loadPacks(force) {
   }
   if (!data || !data.packs) {
     packsBusy = false;
-    if (data && data.output) show(data.output);
+    // Polls repeat, so one note is reused instead of stacking a new one each time.
+    if (data && data.output) {
+      if (packsNote && packsNote.isOpen()) packsNote.update(data.output, "error");
+      else packsNote = toast(data.output, "error");
+    }
     return;
   }
+  if (packsNote) {
+    packsNote.close();
+    packsNote = null;
+  }
   packs = data.packs;
+  packsLoaded = true;
   fillConsolePacks();
   const svc = data.service || {};
   paintDot("svc-dot", svc.active === "active", svc.active);
   paintDot("boot-dot", svc.enabled === "enabled", svc.enabled);
   syncPacks();
-  if (out.textContent === "Loading…" && !consoleName) out.textContent = actionText;
   saveState();
   packsBusy = false;
   refreshConsole();
 }
 
-document.getElementById("packs").onclick = async (ev) => {
-  const btn = ev.target.closest("button");
+const ACT_LABELS = {
+  start: "Starting", stop: "Stopping", restart: "Restarting", enable: "Enabling", disable: "Disabling",
+};
+
+document.getElementById("packs").onclick = (ev) => {
+  const btn = ev.target.closest("button[data-act]");
   if (!btn || rowBusy) return;
-  const tr = btn.closest("tr");
-  const name = tr.dataset.name;
-  const act = btn.dataset.act;
+  const name = btn.closest("tr").dataset.name;
+  if (btn.dataset.act === "more") {
+    if (!rowMenu.hidden && rowMenuAnchor === btn) closeRowMenu(true);
+    else openRowMenu(btn, name);
+    return;
+  }
+  rowAction(btn.dataset.act, name, btn);
+};
+
+function askPort(name, current) {
+  ask(`<form>
+    <p>Set the port for <strong>${esc(name)}</strong>.</p>
+    <label>Port <input type="number" name="port" min="1" max="65535" value="${esc(current)}" required></label>
+    <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Save</button></div>
+  </form>`, (fields) => {
+    dlg.close();
+    run({cmd: "port", name, port: fields.port}, `Setting ${name} port to ${fields.port}…`);
+  });
+  const input = dlg.querySelector("[name=port]");
+  input.focus();
+  input.select();
+}
+
+// anchor is the button the action came from, which a menu it opens hangs off.
+async function rowAction(act, name, anchor) {
+  if (rowBusy) return;
   const pack = packs.find((p) => p.name === name);
   if ((act === "start" || act === "stop" || act === "restart") && (!pack || !pack.indexed)) return;
   if (act === "port") {
-    const port = tr.querySelector("[data-port]").value;
-    run({cmd: "port", name, port}, `Setting ${name} port to ${port}…`);
+    askPort(name, pack && pack.port !== "-" ? pack.port : "");
     return;
   }
   if (act === "props") {
-    if (propsMenu.dataset.name === name && !propsMenu.hidden) closeProps(true);
-    else openProps(btn, name);
+    openProps(anchor, name);
     return;
   }
   if (act === "log") {
-    // The console sits below the list, often off screen.
-    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    document.querySelector(".console-head").scrollIntoView({behavior: reduce ? "auto" : "smooth", block: "start"});
+    // On narrow screens the console sits below the list, often off screen.
+    const panel = document.querySelector(".console-panel");
+    const top = panel.getBoundingClientRect().top;
+    if (top < 0 || top > window.innerHeight * 0.6) {
+      const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      panel.scrollIntoView({behavior: reduce ? "auto" : "smooth", block: "start"});
+    }
     // A running server streams into the console. A stopped one shows its last log once.
     if (runningPacks().some((p) => p.name === name)) {
       followConsole(name);
       return;
     }
     hold = true;
-    show(`Reading ${name} log…`);
+    showStatic(`Reading ${name} log…`);
     try {
       const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=0");
-      if (data) show(data.ok === false ? (data.output || "Could not read the log.") : `${name} is not running. Last log:\n\n${data.output || "(empty)"}`);
+      if (data) showStatic(data.ok === false ? (data.output || "Could not read the log.") : `${name} is not running. Last log:\n\n${data.output || "(empty)"}`);
     } catch {
-      show("The page could not reach the server.");
+      showStatic("The page could not reach the server.");
     } finally { hold = false; }
     out.scrollTop = out.scrollHeight;
     return;
@@ -1353,7 +1731,7 @@ document.getElementById("packs").onclick = async (ev) => {
       <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit" class="danger">Uninstall</button></div>
     </form>`, (fields) => {
       dlg.close();
-      if (String(fields.confirm).toLowerCase() !== "yes") { show("Cancelled."); return; }
+      if (String(fields.confirm).toLowerCase() !== "yes") { toast("Uninstall cancelled.", "ok"); return; }
       run({cmd: "uninstall", name, confirm: "yes"}, `Uninstalling ${name}…`);
     });
     return;
@@ -1373,17 +1751,19 @@ document.getElementById("packs").onclick = async (ev) => {
       <label><input type="radio" name="world" value="delete"> Delete the world</label>
       <label id="del-label" hidden>Type yes to delete the world <input name="delete_confirm" autocomplete="off"></label>
       <label>Type yes to update <input name="confirm" autocomplete="off" required></label>
+      <p id="upd-msg" class="dlg-msg" role="alert"></p>
       <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit" id="upd-go" disabled>Update</button></div>
     </form>`, (fields) => {
       if (!checked) return;
       const world = fields.world || "keep";
-      if (String(fields.confirm).toLowerCase() !== "yes") { show("Cancelled."); dlg.close(); return; }
+      if (String(fields.confirm).toLowerCase() !== "yes") { toast("Update cancelled.", "ok"); dlg.close(); return; }
+      const updMsg = dlg.querySelector("#upd-msg");
       if (world === "delete" && String(fields.delete_confirm || "").toLowerCase() !== "yes") {
-        show("Cancelled. Type yes to delete the world.");
+        updMsg.textContent = "Type yes to delete the world, or choose Keep the world.";
         return;
       }
       if (!(pack && pack.curseforge) && !fields.mod_id) {
-        show("Choose a CurseForge modpack first.");
+        updMsg.textContent = "Choose a CurseForge modpack first.";
         return;
       }
       dlg.close();
@@ -1489,8 +1869,9 @@ document.getElementById("packs").onclick = async (ev) => {
     }
     return;
   }
-  run({cmd: act, name}, `${act} ${name}…`);
-};
+  if (!ACT_LABELS[act]) return;
+  run({cmd: act, name}, `${ACT_LABELS[act]} ${name}…`);
+}
 
 // The server.properties menu floats over the page, outside the table, so a
 // table redraw or saved page state never holds a half-open menu.
@@ -1498,14 +1879,88 @@ const propsMenu = document.getElementById("props-menu");
 let propsTicket = 0;
 let propsAnchor = null;
 
-function placeProps() {
-  if (!propsAnchor || !propsAnchor.isConnected) return;
-  const r = propsAnchor.getBoundingClientRect();
-  const width = propsMenu.offsetWidth;
-  const left = Math.max(8, Math.min(r.left, document.documentElement.clientWidth - width - 8));
-  propsMenu.style.left = (left + window.scrollX) + "px";
-  propsMenu.style.top = (r.bottom + window.scrollY + 3) + "px";
+// Lines a floating menu's right edge up with its button, kept on screen.
+function placeMenu(menu, anchor) {
+  if (!anchor || !anchor.isConnected) return;
+  const r = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth;
+  const left = Math.max(8, Math.min(r.right - width, document.documentElement.clientWidth - width - 8));
+  menu.style.left = (left + window.scrollX) + "px";
+  menu.style.top = (r.bottom + window.scrollY + 4) + "px";
 }
+
+function placeProps() {
+  placeMenu(propsMenu, propsAnchor);
+}
+
+// Each row's ⋯ menu, drawn outside the table like the properties menu.
+const rowMenu = document.getElementById("row-menu");
+let rowMenuAnchor = null;
+
+function closeRowMenu(refocus) {
+  if (rowMenu.hidden) return;
+  rowMenu.hidden = true;
+  if (rowMenuAnchor) {
+    rowMenuAnchor.setAttribute("aria-expanded", "false");
+    if (refocus && rowMenuAnchor.isConnected) rowMenuAnchor.focus();
+  }
+  rowMenuAnchor = null;
+}
+
+function openRowMenu(btn, name) {
+  closeRowMenu();
+  closeProps();
+  const pack = packs.find((p) => p.name === name);
+  if (!pack) return;
+  rowMenu.replaceChildren(...rowMenuItems(pack).map((item) => {
+    if (item === "-") return document.createElement("hr");
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "menuitem");
+    b.dataset.act = item[0];
+    b.textContent = item[1];
+    if (item[0] === "uninstall") b.className = "danger";
+    return b;
+  }));
+  rowMenu.setAttribute("aria-label", `Actions for ${name}`);
+  rowMenu.dataset.name = name;
+  rowMenu.hidden = false;
+  rowMenuAnchor = btn;
+  btn.setAttribute("aria-expanded", "true");
+  placeMenu(rowMenu, btn);
+  rowMenu.querySelector("button").focus();
+}
+
+rowMenu.onclick = (ev) => {
+  const b = ev.target.closest("button[data-act]");
+  if (!b) return;
+  const name = rowMenu.dataset.name;
+  const anchor = rowMenuAnchor;
+  closeRowMenu(false);
+  rowAction(b.dataset.act, name, anchor);
+};
+
+rowMenu.onkeydown = (ev) => {
+  const items = [...rowMenu.querySelectorAll("button")];
+  const i = items.indexOf(document.activeElement);
+  if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    ev.preventDefault();
+    const next = items[(i + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
+    if (next) next.focus();
+  } else if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeRowMenu(true);
+  } else if (ev.key === "Tab") {
+    closeRowMenu(false);
+  }
+};
+
+document.addEventListener("pointerdown", (ev) => {
+  if (rowMenu.hidden) return;
+  if (rowMenu.contains(ev.target) || (rowMenuAnchor && rowMenuAnchor.contains(ev.target))) return;
+  closeRowMenu();
+});
+window.addEventListener("resize", () => placeMenu(rowMenu, rowMenuAnchor));
 
 function closeProps(refocus) {
   propsTicket++;
@@ -1631,52 +2086,67 @@ document.addEventListener("pointerdown", (ev) => {
 });
 window.addEventListener("resize", placeProps);
 
-function clearSearch() {
-  if (searchAbort) searchAbort.abort();
-  document.getElementById("search-q").value = "";
-  document.getElementById("search-results").innerHTML = "";
-  if (actionText.startsWith("Searching for ")) {
-    actionText = "";
-    if (consoleName === "") out.textContent = "";
-    saveState();
-  }
-}
+// Installing lives in its own dialog, so the list and console keep updating
+// while the person browses results.
+const installDlg = document.getElementById("install-dlg");
+const searchMsg = document.getElementById("search-msg");
 
-document.getElementById("search-clear").onclick = clearSearch;
+document.getElementById("install-open").onclick = () => {
+  installDlg.showModal();
+  const q = document.getElementById("search-q");
+  q.focus();
+  q.select();
+};
+document.getElementById("install-close").onclick = () => installDlg.close();
+installDlg.addEventListener("close", () => {
+  if (searchAbort) searchAbort.abort();
+});
+
+function install(item) {
+  if (!window.confirm(`Install ${item.name}?`)) return;
+  installDlg.close();
+  // Installing holds modman for minutes, so polls would only queue behind it.
+  hold = true;
+  const note = toast(`Installing ${item.name}… This can take several minutes.`, "busy");
+  api("/api/install", {id: String(item.id)}).then((res) => {
+    if (!res) note.close();
+    else note.update(res.output || (res.ok ? "Done." : "Failed."), res.ok === false ? "error" : "ok");
+  }).catch((err) => {
+    note.update(err instanceof ApiTimeout ? err.message : "The page could not reach the server.", "error");
+  }).finally(() => { hold = false; loadPacks(true); });
+}
 
 document.getElementById("search-form").onsubmit = async (ev) => {
   ev.preventDefault();
   if (searchAbort) searchAbort.abort();
   const query = document.getElementById("search-q").value;
+  const list = document.getElementById("search-results");
   const ctrl = new AbortController();
   searchAbort = ctrl;
   hold = true;
-  show(`Searching for ${query}…`);
+  searchMsg.textContent = `Searching for ${query}…`;
   try {
     const data = await api("/api/search", {query}, ctrl.signal);
     if (searchAbort !== ctrl) return;
-    const list = document.getElementById("search-results");
-    list.innerHTML = "";
+    list.replaceChildren();
     if (!data) return;
-    show(data.output || "");
-    (data.results || []).forEach((item) => {
+    const results = Array.isArray(data.results) ? data.results : [];
+    searchMsg.textContent = data.output || (results.length ? "" : "No matches.");
+    for (const item of results) {
+      const li = document.createElement("li");
       const b = document.createElement("button");
       b.type = "button";
       b.innerHTML = `<strong>${esc(item.name)}</strong> <span class="muted">${esc(item.downloads)} downloads</span><br><span class="muted">${esc(item.summary || "")}</span>`;
-      b.onclick = () => {
-        if (!window.confirm(`Install ${item.name}?`)) return;
-        hold = true;
-        show(`Installing ${item.name}…`);
-        api("/api/install", {id: String(item.id)}).then((res) => {
-          if (res) show(res.output || (res.ok ? "Done." : "Failed."));
-        }).catch((err) => {
-          show(err instanceof ApiTimeout ? err.message : "The page could not reach the server.");
-        }).finally(() => { hold = false; loadPacks(true); });
-      };
-      list.appendChild(b);
-    });
+      b.onclick = () => install(item);
+      li.appendChild(b);
+      list.appendChild(li);
+    }
   } catch (err) {
-    if (!err || err.name !== "AbortError") show(String(err && err.message || err));
+    if (!err || err.name !== "AbortError") {
+      searchMsg.textContent = err instanceof ApiTimeout ? err.message : "The page could not reach the server.";
+    } else if (searchAbort === ctrl) {
+      searchMsg.textContent = "";
+    }
   } finally {
     if (searchAbort === ctrl) {
       searchAbort = null;
@@ -1690,7 +2160,7 @@ document.getElementById("unlock").onclick = () => {
   loadPacks(true);
 };
 
-if (!restoreState()) out.textContent = "Loading…";
+if (!restoreState()) render();
 // The saved table may have been stored while a row was busy.
 clearBusy();
 loadPacks();
