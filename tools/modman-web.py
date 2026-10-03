@@ -2,12 +2,14 @@
 """Local control page for modman. Started by `web start`, not run on its own."""
 
 import base64
+import gzip
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import select
 import ssl
 import subprocess
 import sys
@@ -237,6 +239,79 @@ def modman_call(args, timeout):
             text=True,
             timeout=timeout,
         )
+
+
+# A console poll with nothing new waits up to LOG_WAIT seconds for the log to
+# grow before answering, so an idle console costs one request per LOG_WAIT.
+LOG_WAIT = 20
+LOG_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+root_holder = [None]
+
+
+def minecraft_root():
+    if root_holder[0] is None:
+        try:
+            proc = modman_call(["root"], 10)
+        except subprocess.TimeoutExpired:
+            return ""
+        root = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        root_holder[0] = root if os.path.isabs(root) else ""
+    return root_holder[0]
+
+
+# (session, page id) -> [newest request number, last used]. A page's newer
+# console request, such as on switching servers, ends the wait of its older one
+# with a normal reply, so the page never has to cancel a request.
+log_turns = {}
+log_turns_lock = threading.Lock()
+PAGE_ID_RE = re.compile(r"[A-Za-z0-9]{8,40}")
+
+
+def take_log_turn(key):
+    now = time.monotonic()
+    with log_turns_lock:
+        if len(log_turns) > 256:
+            for old in [k for k, v in log_turns.items() if now - v[1] > 3600]:
+                del log_turns[old]
+        entry = log_turns.setdefault(key, [0, now])
+        entry[0] += 1
+        entry[1] = now
+        return entry[0]
+
+
+def log_turn_current(key, turn):
+    with log_turns_lock:
+        entry = log_turns.get(key)
+        return entry is not None and entry[0] == turn
+
+
+def wait_for_log(name, offset, conn, key, turn):
+    # Returns "grew" (or "timeout") to read the log again, "superseded" when the
+    # same page sent a newer request, and "gone" when the page hung up.
+    # modman has already checked name; this only re-checks it before building
+    # a path. A missing or odd root just skips the wait.
+    root = minecraft_root()
+    if not root or not LOG_NAME_RE.fullmatch(name) or ".." in name:
+        return "grew"
+    path = os.path.join(root, name, "logs", "latest.log")
+    deadline = time.monotonic() + LOG_WAIT
+    while time.monotonic() < deadline:
+        try:
+            if os.stat(path).st_size != offset:
+                return "grew"
+        except OSError:
+            return "grew"
+        if key is not None and not log_turn_current(key, turn):
+            return "superseded"
+        # The page sends nothing while it waits, so the socket only turns
+        # readable when the browser closes it.
+        try:
+            readable, _, _ = select.select([conn], [], [], 0.5)
+        except (OSError, ValueError):
+            return "gone"
+        if readable:
+            return "gone"
+    return "timeout"
 
 
 def parse_log_frame(stdout):
@@ -506,6 +581,7 @@ let hold = false;
 let rowBusy = false;
 let packsBusy = false;
 let packsTicket = 0;
+let packsAsked = 0;
 let logBusy = false;
 let packs = [];
 let searchAbort = null;
@@ -1050,6 +1126,13 @@ function showConsole(text, replace) {
   saveState();
 }
 
+// The server holds an idle log request open until new lines arrive. A newer
+// request from this page, such as a forced refresh after switching servers,
+// makes the server answer the waiting one at once, so nothing is cancelled.
+// A forced refresh never waits itself, since the page shows it as busy.
+const PAGE_ID = Array.from(crypto.getRandomValues(new Uint8Array(12)),
+  (b) => b.toString(16).padStart(2, "0")).join("");
+
 async function refreshConsole(force) {
   if (!consoleName || hold || dlg.open) return;
   if ((consoleBusy || logBusy) && !force) return;
@@ -1058,7 +1141,8 @@ async function refreshConsole(force) {
   const name = consoleName;
   const offset = consoleOffset;
   try {
-    const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=" + offset);
+    const data = await api("/api/log?name=" + encodeURIComponent(name) + "&offset=" + offset +
+      "&page=" + PAGE_ID + (force ? "&wait=0" : ""));
     if (ticket !== consoleTicket || !data || hold || name !== consoleName) return;
     if (data.ok === false) {
       document.getElementById("console-msg").textContent = data.output || "Failed.";
@@ -1073,7 +1157,23 @@ async function refreshConsole(force) {
     }
     showConsole(chunk, replace);
   } finally {
-    logBusy = false;
+    // An older request answering late leaves the newer one's busy flag alone.
+    if (ticket === consoleTicket) logBusy = false;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Each request returns as soon as the log grows, so poll again right away.
+// The one-second floor keeps errors from spinning.
+async function consoleLoop() {
+  for (;;) {
+    const start = Date.now();
+    if (!document.hidden) {
+      try { await refreshConsole(); } catch {}
+    }
+    const left = 1000 - (Date.now() - start);
+    if (left > 0) await sleep(left);
   }
 }
 
@@ -1145,6 +1245,7 @@ document.getElementById("console-form").onsubmit = async (ev) => {
 async function loadPacks(force) {
   if (!force && (hold || rowBusy || dlg.open || packsBusy)) return;
   packsBusy = true;
+  packsAsked = Date.now();
   const ticket = ++packsTicket;
   let data;
   try {
@@ -1558,8 +1659,22 @@ if (!restoreState()) out.textContent = "Loading…";
 // The saved table may have been stored while a row was busy.
 clearBusy();
 loadPacks();
-setInterval(loadPacks, 5000);
-setInterval(refreshConsole, 2000);
+// Polling a hidden tab only burns bandwidth and server CPU, so pause it and
+// catch up as soon as the tab is shown again.
+// The list only needs to be quick while a server boots, so the table shows
+// it come up. Otherwise just CPU, RAM and uptime change, and each poll costs
+// the host about a second of CPU. Every finished action reloads it at once.
+const PACKS_FAST = 5000;
+const PACKS_SLOW = 15000;
+setInterval(() => {
+  if (document.hidden) return;
+  const wait = packs.some((p) => p.status === "starting") ? PACKS_FAST : PACKS_SLOW;
+  if (Date.now() - packsAsked >= wait) loadPacks();
+}, 1000);
+consoleLoop();
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) loadPacks();
+});
 </script>
 </body>
 </html>
@@ -1635,9 +1750,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def send_json(self, code, obj):
-        data = json.dumps(obj).encode("utf-8")
+        data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        # The pack list is polled every few seconds, so compress anything
+        # sizeable. No JSON reply carries a secret, so BREACH does not apply.
+        gzipped = len(data) > 512 and "gzip" in self.headers.get("Accept-Encoding", "")
+        if gzipped:
+            data = gzip.compress(data, compresslevel=6)
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if gzipped:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -1730,7 +1853,9 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query or "")
             name = (query.get("name") or [""])[0]
             offset = (query.get("offset") or ["0"])[0]
-            self.handle_log(name, offset)
+            page = (query.get("page") or [""])[0]
+            wait = (query.get("wait") or ["1"])[0] != "0"
+            self.handle_log(name, offset, page, wait)
             return
         if parsed.path == "/api/props":
             query = parse_qs(parsed.query or "")
@@ -1846,9 +1971,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, data)
 
-    def handle_log(self, name, offset):
+    def handle_log(self, name, offset, page="", wait=True):
         if not str(offset).isdigit() or len(str(offset)) > 18:
             offset = "0"
+        key = (self.cookie_token(), page) if PAGE_ID_RE.fullmatch(page) else None
+        turn = take_log_turn(key) if key is not None else 0
         try:
             proc = modman_call(["log", name, str(offset)], 30)
         except subprocess.TimeoutExpired:
@@ -1867,6 +1994,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"ok": False, "output": "Could not read the log.", "offset": 0, "reset": True})
             return
         reset, new_offset, body = parsed
+        if wait and not reset and not body and new_offset == int(offset) > 0:
+            outcome = wait_for_log(name, new_offset, self.connection, key, turn)
+            if outcome == "gone":
+                self.close_connection = True
+                return
+            if outcome == "superseded":
+                self.send_json(200, {"ok": True, "output": "", "offset": new_offset, "reset": False})
+                return
+            try:
+                proc = modman_call(["log", name, str(offset)], 30)
+            except subprocess.TimeoutExpired:
+                proc = None
+            again = parse_log_frame(proc.stdout or "") if proc and proc.returncode == 0 else None
+            if again is not None:
+                reset, new_offset, body = again
         self.send_json(200, {
             "ok": True,
             "output": body,

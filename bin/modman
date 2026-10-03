@@ -3512,6 +3512,7 @@ web_call() {
 	case "$op" in
 	packs) web_json_packs ;;
 	log) web_show_log "${1:-}" "${2:-}" ;;
+	root) printf '%s\n' "$MINECRAFT_ROOT" ;;
 	command) web_send_command "${1:-}" "${2:-}" ;;
 	props) web_properties "${1:-}" ;;
 	search) web_search "${1:-}" ;;
