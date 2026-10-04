@@ -25,6 +25,9 @@ WEB_KEY_FILE="${ROOT_DIR}/data/.modman-web-key.pem"
 WEB_CA_FILE="${ROOT_DIR}/data/.modman-web-ca.pem"
 WEB_CA_KEY_FILE="${ROOT_DIR}/data/.modman-web-ca-key.pem"
 WEB_DOMAIN_FILE="${ROOT_DIR}/data/.modman-web-domain"
+WEB_ADMIN_HASH_FILE="${ROOT_DIR}/data/.modman-web-admin-hash"
+WEB_BLACKLIST_FILE="${ROOT_DIR}/data/blacklist.txt"
+WEB_VIEW_HASH_FILE="${ROOT_DIR}/data/.modman-web-view-hash"
 CF_CANCELLED=0
 
 usage() {
@@ -36,7 +39,7 @@ Usage: $(basename "$0")
 Interactive modpack manager for ${SYSTEMD_SERVICE} (via index.txt).
 Type commands at the prompt; type exit to leave.
 
---web and -w run one webpage command, then exit. ACTION is start, stop, restart, status, enable, disable, or install.
+--web and -w run one webpage command, then exit. ACTION is start, stop, restart, status, password, admin, viewer, enable, disable, or install.
 
 Status values (STATUS column only — start/stop/restart use live screen presence):
   stopped                    No live screen session
@@ -73,6 +76,8 @@ Commands:
   web status                 Show the control page link when it is running
   web password               Set or change the webpage password
   web pswd                   Set or change the webpage password
+  web admin                  Set or change the admin password for blacklisted console commands
+  web viewer                 Set or change a view-only password for the webpage
   web enable                 Enable the webpage service to start at boot
   web disable                Disable the webpage service from starting at boot
   web install                Install the webpage service for the current user
@@ -108,6 +113,8 @@ Examples:
   web stop
   web restart
   web password
+  web admin
+  web viewer
   web install
   web enable
   web disable
@@ -3840,10 +3847,12 @@ WEB_HASH_RE='^scrypt\$[0-9]+\$[0-9]+\$[0-9]+\$[0-9a-f]{32}\$[0-9a-f]{64}$'
 WEB_LEGACY_HASH_RE='^[0-9a-f]{64}$'
 WEB_PASSWORD_MIN=4
 
-# Prompt for the webpage password and store its hash in WEB_PASSWORD_HASH.
+# Prompt for a password and store its hash in WEB_PASSWORD_HASH.
+# LABEL names it in the prompt: "the webpage" unless given.
 web_prompt_hash() {
+	local label="${1:-the webpage}"
 	local password again
-	if ! IFS= read -r -s -p "Password for the webpage (at least ${WEB_PASSWORD_MIN} characters): " password; then
+	if ! IFS= read -r -s -p "Password for ${label} (at least ${WEB_PASSWORD_MIN} characters): " password; then
 		echo
 		return 1
 	fi
@@ -4032,6 +4041,45 @@ web_password() {
 	fi
 }
 
+# Prompt for a password labelled LABEL and save its hash to FILE.
+web_prompt_save_hash() {
+	local file="$1" label="$2" old_umask
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "Error: setting a password needs python3." >&2
+		return 1
+	fi
+	web_prompt_hash "$label" || return 1
+	old_umask="$(umask)"
+	umask 077
+	if ! printf '%s\n' "$WEB_PASSWORD_HASH" >"$file"; then
+		umask "$old_umask"
+		unset WEB_PASSWORD_HASH
+		echo "Error: failed to write $file" >&2
+		return 1
+	fi
+	umask "$old_umask"
+	chmod 600 "$file"
+	unset WEB_PASSWORD_HASH
+}
+
+# The page reads this hash on every blacklisted command, so no restart is needed.
+web_admin_password() {
+	echo "Console commands listed in $WEB_BLACKLIST_FILE need this password on the webpage."
+	web_prompt_save_hash "$WEB_ADMIN_HASH_FILE" "admin commands" || return 1
+	echo "Admin password updated."
+	if [[ ! -f "$WEB_BLACKLIST_FILE" ]]; then
+		echo "No blacklist yet. Put one command per line in $WEB_BLACKLIST_FILE."
+	fi
+}
+
+# The page reads this hash at each sign-in, so no restart is needed. Changing
+# it signs out everyone who signed in with the old one.
+web_viewer_password() {
+	echo "This password signs in to the webpage to watch the servers, without changing anything."
+	web_prompt_save_hash "$WEB_VIEW_HASH_FILE" "the view-only webpage" || return 1
+	echo "View-only password updated. Delete $WEB_VIEW_HASH_FILE to turn it off."
+}
+
 web_status() {
 	if web_is_running; then
 		echo "The webpage is running."
@@ -4125,7 +4173,7 @@ web_disable() {
 web_control() {
 	local action="${1:-}"
 	if (($# > 1)); then
-		echo "Error: 'web' takes one action: start, stop, restart, status, password, enable, disable, or install." >&2
+		echo "Error: 'web' takes one action: start, stop, restart, status, password, admin, viewer, enable, disable, or install." >&2
 		return 1
 	fi
 	case "$action" in
@@ -4144,6 +4192,12 @@ web_control() {
 	password|pswd)
 		web_password
 		;;
+	admin)
+		web_admin_password
+		;;
+	viewer)
+		web_viewer_password
+		;;
 	enable)
 		web_enable
 		;;
@@ -4154,7 +4208,7 @@ web_control() {
 		web_install
 		;;
 	"")
-		echo "Error: 'web' requires start, stop, restart, status, password, enable, disable, or install." >&2
+		echo "Error: 'web' requires start, stop, restart, status, password, admin, viewer, enable, disable, or install." >&2
 		return 1
 		;;
 	*)
@@ -4296,7 +4350,7 @@ _repl_candidates() {
 			;;
 		web)
 			if ((cword == 1)); then
-				_ci_matches "$cur" start stop restart status password pswd enable disable install
+				_ci_matches "$cur" start stop restart status password pswd admin viewer enable disable install
 			fi
 			;;
 		enable)

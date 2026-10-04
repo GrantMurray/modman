@@ -241,11 +241,35 @@ From anywhere else, use a domain name. Put that name on one line in `data/.modma
 | `web restart` | Shuts the page down and starts it again |
 | `web status` | Prints the link again |
 | `web password` | Sets or changes the webpage password. `web pswd` does the same |
+| `web admin` | Sets or changes the admin password for blacklisted console commands |
+| `web viewer` | Sets or changes a view-only password for the page |
 | `web install` | Asks for a password, saves the hash, and installs `modman-web.service`. Does not enable or start the page |
 | `web enable` | Starts the page at boot with the saved password. Does not start it now |
 | `web disable` | Stops the page from starting at boot. Leaves a running page up |
 
-From the shell, `modman --web start` and `modman -w status` run one of those commands and then exit. The actions are start, stop, restart, status, password, enable, disable, and install. `web password` restarts a running page so the new password is the one that signs in.
+From the shell, `modman --web start` and `modman -w status` run one of those commands and then exit. The actions are start, stop, restart, status, password, admin, viewer, enable, disable, and install. `web password` restarts a running page so the new password is the one that signs in.
+
+### View-only sign-in
+
+`web viewer` sets a second password for the page. Signing in with it shows the server list, status, usage, and the consoles, with a **View only** tag in the header. The buttons that change anything are hidden: Start, Stop, the **⋯** menu, **Install modpack**, the **Service** menu, and the console command box. **Log** still works. The page refuses those actions from a view-only sign-in even if a request is sent another way.
+
+The page reads the view-only password at each sign-in, so it needs no restart. Running `web viewer` again signs out everyone who used the old one. To turn view-only sign-in off, delete `data/.modman-web-view-hash`; that also signs out every view-only sign-in. Wrong passwords count toward the same limit whichever password was meant.
+
+### Blacklisted console commands
+
+`data/blacklist.txt` lists console commands the page will only send with an admin password. That password is separate from the page password, so someone who can sign in still cannot stop a server or op a player from the console without it. Set it with `web admin`.
+
+Start from the example:
+
+```bash
+cp ~/.local/share/modman/data/blacklist.txt.example ~/.local/share/modman/data/blacklist.txt
+```
+
+Put one command per line. A line matches any command that starts with its words, so `gamerule keepInventory` blocks that rule and leaves other gamerules alone, and `stop` does not block `stopwatch`. Case, a leading `/`, and a namespace such as `minecraft:` are ignored. The command after each `run` in an `execute` command is checked too. Anything after `#` is a comment.
+
+When a command on the list is sent, the page asks for the admin password and sends it with that one command only. Wrong admin passwords count toward the same 10-per-15-minutes limit as sign-ins. If the list has commands but no admin password is set, those commands are refused. The page reads the list and the password each time, so changes apply without a restart.
+
+The blacklist only covers the page's console box. `join` at the `modman>` prompt is a direct console and is not limited.
 
 ## Open the page from the internet
 

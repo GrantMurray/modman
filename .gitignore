@@ -5,6 +5,8 @@ data/.modman-web.state
 data/.modman-web.log
 data/.modman-service-state
 data/.modman-web-hash
+data/.modman-web-admin-hash
+data/.modman-web-view-hash
 data/.modman-web-scheme
 data/.modman-web-cert.pem
 data/.modman-web-key.pem
@@ -17,3 +19,4 @@ data/.modman-web-acme-key.pem
 data/.modman-web-acme/
 __pycache__/
 *.pyc
+blacklist.txt

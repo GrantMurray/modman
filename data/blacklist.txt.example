@@ -1,0 +1,14 @@
+# Console commands the webpage only sends with the admin password.
+# Copy this file to blacklist.txt and set the password with: web admin
+#
+# One command per line. A line matches any command that starts with its words,
+# so "gamerule keepInventory" blocks that rule but not other gamerules.
+# Case, a leading /, and a namespace such as minecraft: are ignored.
+# Anything after # is a comment.
+stop
+op
+deop
+ban
+ban-ip
+pardon
+whitelist off

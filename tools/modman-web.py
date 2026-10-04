@@ -36,6 +36,9 @@ LE_CERT = os.path.join(DATA_DIR, ".modman-web-le-cert.pem") if DATA_DIR else ""
 LE_KEY = os.path.join(DATA_DIR, ".modman-web-le-key.pem") if DATA_DIR else ""
 ACME_ACCOUNT = os.path.join(DATA_DIR, ".modman-web-acme-key.pem") if DATA_DIR else ""
 CHALLENGE_DIR = os.path.join(DATA_DIR, ".modman-web-acme") if DATA_DIR else ""
+ADMIN_HASH_FILE = os.path.join(DATA_DIR, ".modman-web-admin-hash") if DATA_DIR else ""
+BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.txt") if DATA_DIR else ""
+VIEW_HASH_FILE = os.path.join(DATA_DIR, ".modman-web-view-hash") if DATA_DIR else ""
 le_holder = [None]
 
 if not PASSWORD_FILE or not os.path.isfile(PASSWORD_FILE):
@@ -158,6 +161,93 @@ def password_ok(given):
     return hmac.compare_digest(got, PASSWORD_DIGEST)
 
 
+def command_words(text):
+    """Lowercase words of a console command, without a leading / or a namespace
+    such as minecraft: on the command name."""
+    words = text.strip().lower().lstrip("/").split()
+    if words:
+        words[0] = words[0].rpartition(":")[2]
+    return words
+
+
+def read_blacklist():
+    """Each line of blacklist.txt is a command, or the first words of one.
+    Read on every send, so edits apply without a restart."""
+    rules = []
+    if not BLACKLIST_FILE or not os.path.isfile(BLACKLIST_FILE):
+        return rules
+    try:
+        with open(BLACKLIST_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0]
+                words = command_words(line)
+                if words:
+                    rules.append(words)
+    except (OSError, UnicodeDecodeError):
+        pass
+    return rules
+
+
+def blacklisted(command):
+    """The blacklist line that command matches, or "". The command after each
+    `run` in an execute command is checked too."""
+    rules = read_blacklist()
+    if not rules:
+        return ""
+    words = command_words(command)
+    starts = [0]
+    if words and words[0] == "execute":
+        starts += [i + 1 for i, word in enumerate(words) if word == "run"]
+    for start in starts:
+        tail = command_words(" ".join(words[start:]))
+        for rule in rules:
+            if tail[:len(rule)] == rule:
+                return " ".join(rule)
+    return ""
+
+
+def read_hash_file(path):
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip().lower()
+    except OSError:
+        return ""
+
+
+def stored_password_ok(stored, given):
+    """Check given against a scrypt hash saved by `web admin` or `web viewer`."""
+    if not given or not stored:
+        return False
+    match = SCRYPT_RE.fullmatch(stored)
+    if not match:
+        return False
+    n, r, p = (int(x) for x in match.group(1, 2, 3))
+    if not (2 ** 10 <= n <= 2 ** 17 and n & (n - 1) == 0 and 1 <= r <= 16 and 1 <= p <= 4):
+        return False
+    digest = bytes.fromhex(match.group(5))
+    got = hashlib.scrypt(
+        given.encode("utf-8"),
+        salt=bytes.fromhex(match.group(4)),
+        n=n,
+        r=r,
+        p=p,
+        maxmem=2 * 128 * r * n * p + (1 << 20),
+        dklen=len(digest),
+    )
+    return hmac.compare_digest(got, digest)
+
+
+def admin_password_ok(given):
+    # Read each time, so a new admin password applies without a restart.
+    return stored_password_ok(read_hash_file(ADMIN_HASH_FILE), given)
+
+
+def admin_password_set():
+    return bool(ADMIN_HASH_FILE) and os.path.isfile(ADMIN_HASH_FILE) and os.path.getsize(ADMIN_HASH_FILE) > 0
+
+
 def login_blocked(addr):
     now = time.monotonic()
     with login_lock:
@@ -188,31 +278,37 @@ def login_succeeded(addr):
         login_failures.pop(addr, None)
 
 
-def new_session():
+# view_hash is "" for a full sign-in. A view-only sign-in keeps the hash it
+# signed in with, and ends when `web viewer` changes or removes that password.
+def new_session(view_hash=""):
     token = secrets.token_urlsafe(32)
     now = time.monotonic()
     with sessions_lock:
-        for key, (created, used) in list(sessions.items()):
+        for key, (created, used, _) in list(sessions.items()):
             if now - created > SESSION_MAX or now - used > SESSION_IDLE:
                 del sessions[key]
-        sessions[token] = [now, now]
+        sessions[token] = [now, now, view_hash]
     return token
 
 
-def session_ok(token):
+def session_role(token):
+    """"full", "view", or "" when the token is not signed in."""
     if not token:
-        return False
+        return ""
     now = time.monotonic()
     with sessions_lock:
-        times = sessions.get(token)
-        if times is None:
-            return False
-        created, used = times
+        entry = sessions.get(token)
+        if entry is None:
+            return ""
+        created, used, view_hash = entry
         if now - created > SESSION_MAX or now - used > SESSION_IDLE:
             del sessions[token]
-            return False
-        times[1] = now
-        return True
+            return ""
+        if view_hash and not hmac.compare_digest(view_hash, read_hash_file(VIEW_HASH_FILE)):
+            del sessions[token]
+            return ""
+        entry[1] = now
+        return "view" if view_hash else "full"
 
 
 def page_csp(html):
@@ -534,6 +630,11 @@ APP_PAGE = r"""<!DOCTYPE html>
   .spinner { width: 0.9rem; height: 0.9rem; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; flex: none; }
   .spinner[hidden] { display: none; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .view-pill { display: none; }
+  body.view-only .view-pill { display: inline-flex; }
+  body.view-only #svc-menu, body.view-only #install-open, body.view-only [data-primary],
+  body.view-only [data-act="more"], body.view-only #console-cmd,
+  body.view-only #console-form button[type=submit] { display: none; }
   .console-form { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
   .console-form input { flex: 1; min-width: 10rem; }
   #console-msg { margin: 0; }
@@ -662,6 +763,7 @@ APP_PAGE = r"""<!DOCTYPE html>
 <header>
   <h1><img src="/favicon.svg" alt="" width="22" height="22"> modman</h1>
   <div class="header-end">
+    <span class="pill view-pill" title="This sign-in can watch the servers but not change them">View only</span>
     <span class="pill" title="The boot service starts and stops the Active servers together"><span id="svc-dot" class="dot" role="img" aria-label="unknown"></span>Service <b id="svc-text">unknown</b></span>
     <span class="pill" title="Whether the boot service starts the Active servers when this machine boots"><span id="boot-dot" class="dot" role="img" aria-label="unknown"></span>Start at boot <b id="boot-text">unknown</b></span>
     <details class="menu" id="svc-menu">
@@ -1595,12 +1697,27 @@ document.getElementById("console-form").onsubmit = async (ev) => {
   consoleName = name;
   msg.textContent = "";
   remember(command.trim());
+  await sendCommand(name, command);
+};
+
+// A blacklisted command comes back asking for the admin password. The
+// password is sent with that one command and not kept.
+async function sendCommand(name, command, adminPassword) {
+  const input = document.getElementById("console-cmd");
+  const msg = document.getElementById("console-msg");
+  const body = {name, command};
+  if (adminPassword) body.admin_password = adminPassword;
   setConsoleBusy(true);
   try {
-    const data = await api("/api/command", {name, command});
+    const data = await api("/api/command", body);
     if (!data) return;
+    if (data.admin) {
+      msg.textContent = data.output || "";
+      askAdmin(name, command, data.rule || command, adminPassword ? data.output : "");
+      return;
+    }
     if (!data.ok) msg.textContent = data.output || "Failed.";
-    else input.value = "";
+    else { input.value = ""; msg.textContent = ""; }
     await refreshConsole(true);
   } catch {
     msg.textContent = "The page could not reach the server.";
@@ -1610,7 +1727,20 @@ document.getElementById("console-form").onsubmit = async (ev) => {
     if (!input.disabled) input.focus();
   }
   setTimeout(refreshConsole, 500);
-};
+}
+
+function askAdmin(name, command, rule, error) {
+  ask(`<form>
+    <p><code>${esc(rule)}</code> is blacklisted. Enter the admin password to send it to <strong>${esc(name)}</strong>.</p>
+    ${error ? `<p class="danger">${esc(error)}</p>` : ""}
+    <label>Admin password <input type="password" name="admin" autocomplete="off" required></label>
+    <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Send</button></div>
+  </form>`, (fields) => {
+    dlg.close();
+    sendCommand(name, command, fields.admin);
+  });
+  dlg.querySelector("[name=admin]").focus();
+}
 
 // Up and Down step through earlier commands, newest first, like a shell.
 // The list is kept in this browser only.
@@ -2221,6 +2351,11 @@ document.addEventListener("visibilitychange", () => {
 
 LOGIN_CSP = page_csp(LOGIN_PAGE)
 APP_CSP = page_csp(APP_PAGE)
+# The same page with every control that changes something hidden by CSS. The
+# server refuses those requests from a view-only sign-in either way. Only the
+# <body> tag differs, so the script hashes in APP_CSP still match.
+VIEW_PAGE = APP_PAGE.replace("<body>\n<header>", '<body class="view-only">\n<header>', 1)
+assert VIEW_PAGE != APP_PAGE
 LOGIN_ERRORS = {
     "1": "Wrong password.",
     "2": "Too many wrong passwords. Try again later.",
@@ -2300,7 +2435,8 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def authed(self):
-        return session_ok(self.cookie_token())
+        self.role = session_role(self.cookie_token())
+        return bool(self.role)
 
     def send_html(self, code, html, csp):
         data = html.encode("utf-8")
@@ -2450,7 +2586,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authed():
                 self.redirect("/login")
                 return
-            self.send_html(200, APP_PAGE, APP_CSP)
+            self.send_html(200, VIEW_PAGE if self.role == "view" else APP_PAGE, APP_CSP)
             return
         if not self.authed():
             self.send_json(401, {"ok": False, "output": "Sign in required."})
@@ -2488,6 +2624,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.authed():
             self.send_json(401, {"ok": False, "output": "Sign in required."})
+            return
+        # Every POST changes something, so a view-only sign-in sends none.
+        if self.role != "full":
+            self.send_json(403, {"ok": False, "output": "This sign-in is view only."})
             return
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
             self.send_json(400, {"ok": False, "output": "Expected JSON."})
@@ -2541,13 +2681,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         fields = parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
         given = (fields.get("password") or [""])[0]
+        view_hash = ""
         if not password_ok(given):
-            login_failed(addr)
-            time.sleep(1)
-            self.redirect("/login?error=1")
-            return
+            view_hash = read_hash_file(VIEW_HASH_FILE)
+            if not stored_password_ok(view_hash, given):
+                login_failed(addr)
+                time.sleep(1)
+                self.redirect("/login?error=1")
+                return
         login_succeeded(addr)
-        token = new_session()
+        token = new_session(view_hash)
         self.redirect(
             "/",
             f"modman_session={token}; {self.cookie_flags()}",
@@ -2570,10 +2713,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, data)
 
     def handle_command(self, body):
+        command = str(body.get("command") or "")
+        rule = blacklisted(command)
+        if rule:
+            if not admin_password_set():
+                self.send_json(403, {
+                    "ok": False,
+                    "output": f"'{rule}' is blacklisted. Run web admin to set an admin password that allows it.",
+                })
+                return
+            given = str(body.get("admin_password") or "")
+            if not given:
+                self.send_json(403, {"ok": False, "admin": True, "rule": rule,
+                                     "output": f"'{rule}' needs the admin password."})
+                return
+            # Wrong admin passwords count toward the same limit as sign-ins.
+            addr = self.client_address[0]
+            if login_blocked(addr):
+                time.sleep(1)
+                self.send_json(429, {"ok": False, "output": "Too many wrong passwords. Try again in 15 minutes."})
+                return
+            if not admin_password_ok(given):
+                login_failed(addr)
+                time.sleep(1)
+                self.send_json(403, {"ok": False, "admin": True, "rule": rule,
+                                     "output": "Wrong admin password."})
+                return
         self.finish_call([
             "command",
             str(body.get("name") or ""),
-            str(body.get("command") or ""),
+            command,
         ], 30)
 
     def handle_props(self, name):
