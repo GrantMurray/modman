@@ -263,18 +263,56 @@ is_running() {
 	screen -ls 2>/dev/null | grep -E "\.${session}[[:space:]]" | grep -vq 'Dead'
 }
 
-# True when the log was last written no later than the second this pack's
-# screen session started. Unknown start time counts as not older.
-log_older_than_session() {
-	local name="$1" log="$2"
-	local pid elapsed mtime
+# Epoch second this pack's screen session started, or nothing when unknown.
+session_start_epoch() {
+	local name="$1"
+	local pid elapsed
 	pid="$(screen -ls 2>/dev/null | grep -E "\.$(screen_name "$name")[[:space:]]" | grep -v 'Dead' |
 		head -n 1 | grep -oE '^[[:space:]]*[0-9]+' | tr -d '[:space:]')"
 	[[ -n "$pid" ]] || return 1
 	elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+	[[ "$elapsed" =~ ^[0-9]+$ ]] || return 1
+	printf '%s' "$(($(date +%s) - elapsed))"
+}
+
+# True when the log was last written no later than the second this pack's
+# screen session started. Unknown start time counts as not older.
+log_older_than_session() {
+	local name="$1" log="$2"
+	local start mtime
+	start="$(session_start_epoch "$name")" || return 1
 	mtime="$(stat -c %Y "$log" 2>/dev/null)"
-	[[ "$elapsed" =~ ^[0-9]+$ && "$mtime" =~ ^[0-9]+$ ]] || return 1
-	((mtime <= $(date +%s) - elapsed))
+	[[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+	((mtime <= start))
+}
+
+# Lines that open a new server boot in latest.log.
+BOOT_START_RE='ModLauncher running|Loading Minecraft .* with Fabric Loader|Starting minecraft server version'
+
+# Prints this run's log text, oldest first. A server left up past midnight
+# has its log rotated to a dated .log.gz, so latest.log alone can lack the
+# boot and Done lines. Then this walks back through rotated logs written
+# since the session began until it reaches the one holding the boot line.
+_current_run_log() {
+	local name="$1" log="$2"
+	local start f
+	local -a older=()
+	if grep -qE "$BOOT_START_RE" "$log"; then
+		cat "$log"
+		return 0
+	fi
+	if start="$(session_start_epoch "$name")"; then
+		while IFS= read -r f; do
+			[[ "$(basename "$f")" == debug-* ]] && continue
+			(($(stat -c %Y "$f" 2>/dev/null || echo 0) > start)) || break
+			older=("$f" "${older[@]}")
+			grep -qE "$BOOT_START_RE" < <(zcat -- "$f" 2>/dev/null) && break
+		done < <(ls -t -- "${log%/*}"/*.log.gz 2>/dev/null)
+	fi
+	for f in "${older[@]}"; do
+		zcat -- "$f" 2>/dev/null
+	done
+	cat "$log"
 }
 
 # Display helper only. Prints starting, running, or error from latest.log.
@@ -297,7 +335,8 @@ _log_boot_state() {
 		printf '%s' "starting"
 		return 0
 	fi
-	awk '
+	_current_run_log "$name" "$log" | awk '
+		/ModLauncher running/ { crashed = 0; ready = 0 }
 		/Loading Minecraft .* with Fabric Loader/ { crashed = 0; ready = 0 }
 		/Starting minecraft server version/ { crashed = 0; ready = 0 }
 		/Done \([0-9.]+s\)!/ { if (!crashed) ready = 1 }
@@ -311,7 +350,7 @@ _log_boot_state() {
 			else if (ready) print "running"
 			else print "starting"
 		}
-	' "$log"
+	'
 }
 
 # True when this pack's folder is the working directory of a java process.
