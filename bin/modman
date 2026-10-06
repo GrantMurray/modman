@@ -3518,9 +3518,11 @@ update_modpack() {
 		IFS= read -r work
 		IFS= read -r root
 		IFS= read -r generated
-		IFS= read -r zip_sha
-		IFS= read -r hint_disposition
-		IFS= read -r hint_name
+		# Only link and zip staging print these. CurseForge staging stops at
+		# three lines, and a read past the end must not stop the update.
+		IFS= read -r zip_sha || true
+		IFS= read -r hint_disposition || true
+		IFS= read -r hint_name || true
 	} <<<"$staged"
 	# Guess the version before the staged files go away.
 	if [[ "$source" == "curseforge" ]]; then
@@ -4032,16 +4034,32 @@ web_update() {
 		echo "Error: bad CurseForge file id." >&2
 		return 1
 	fi
-	if [[ -n "$link" ]]; then
-		if [[ "$link" != https://* || "$link" =~ [[:space:][:cntrl:]] || ${#link} -gt 2048 ]]; then
-			echo "Error: the link must be one https:// address with no spaces." >&2
-			return 1
-		fi
-		MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_UPDATE_LINK="$link" update_modpack "$name"
-		return
+	if [[ -n "$link" ]] &&
+		[[ "$link" != https://* || "$link" =~ [[:space:][:cntrl:]] || ${#link} -gt 2048 ]]; then
+		echo "Error: the link must be one https:// address with no spaces." >&2
+		return 1
 	fi
-	MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_MOD_ID="$mod_id" MODMAN_EXPECT_FILE="$expect_file" \
-		update_modpack "$name"
+	# The page shows this file in its console while the update runs, the same
+	# lines the terminal would show. It stays until the next update of this
+	# pack. Run like the prompt runs a command: a failed step reports and
+	# returns instead of ending modman.
+	local log="${ROOT_DIR}/data/.update-log-${name}"
+	local status=0
+	if ! : >"$log"; then
+		log=/dev/null
+	fi
+	if [[ -n "$link" ]]; then
+		MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_UPDATE_LINK="$link" \
+			update_modpack "$name" >>"$log" 2>&1 || status=$?
+	else
+		MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_MOD_ID="$mod_id" MODMAN_EXPECT_FILE="$expect_file" \
+			update_modpack "$name" >>"$log" 2>&1 || status=$?
+	fi
+	if ((status != 0)) && [[ "$log" != /dev/null ]] && [[ ! -s "$log" ]]; then
+		echo "Error: the update stopped without saying why (exit status ${status})." >>"$log"
+	fi
+	cat -- "$log"
+	return "$status"
 }
 
 # JSON for the webpage's update dialog: the installed and newest versions,

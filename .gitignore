@@ -4,6 +4,8 @@ data/curseforge-api-key
 data/.modman-web.state
 data/.modman-web.log
 data/.modman-service-state
+data/.update-progress-*
+data/.update-log-*
 data/.modman-web-hash
 data/.modman-web-admin-hash
 data/.modman-web-view-hash

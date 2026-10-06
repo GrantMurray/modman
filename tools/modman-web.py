@@ -1142,9 +1142,22 @@ const UPDATE_STEPS = {
 };
 
 // Run an update request while polling its progress into the row's bar and
-// the busy note. A step without a percent keeps the moving bar.
+// the busy note, and its output into the console's Actions view. A step
+// without a percent keeps the moving bar.
 async function trackUpdate(name, note, request) {
   let live = true;
+  let stepLine = "Starting…";
+  let output = "";
+  // Shows the update in the Actions view. Someone who switched the console
+  // to a server meanwhile keeps that view; the text waits in Actions.
+  const showOutput = () => {
+    actionText = `Updating ${name}: ${stepLine}\n\n${output}`;
+    if (consoleName) return;
+    const stick = consoleAtBottom();
+    setConsoleText(actionText);
+    if (stick) out.scrollTop = out.scrollHeight;
+  };
+  showStatic(`Updating ${name}: ${stepLine}\n\n`);
   const bar = () => {
     const tr = [...document.querySelectorAll("#packs tr")].find((row) => row.dataset.name === name);
     return tr && tr.querySelector(".loadbar");
@@ -1158,24 +1171,41 @@ async function trackUpdate(name, note, request) {
       if (known) el.setAttribute("aria-valuenow", String(pct));
       else el.removeAttribute("aria-valuenow");
     }
-    note.update(`Updating ${name}: ${UPDATE_STEPS[step] || "Working"}${known ? ` ${pct}%` : "…"}`, "busy");
+    stepLine = `${UPDATE_STEPS[step] || "Working"}${known ? ` ${pct}%` : "…"}`;
+    note.update(`Updating ${name}: ${stepLine}`, "busy");
+    showOutput();
   };
   (async () => {
     while (live) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       if (!live) return;
-      let data;
+      let data, log;
       try {
-        data = await api(`/api/update-progress?name=${encodeURIComponent(name)}`);
+        [data, log] = await Promise.all([
+          api(`/api/update-progress?name=${encodeURIComponent(name)}`),
+          api(`/api/update-log?name=${encodeURIComponent(name)}`),
+        ]);
       } catch {
         continue;
       }
       // The update may have finished while this poll was out.
-      if (live && data && data.step) show(data.step, data.percent);
+      if (!live) return;
+      if (log && typeof log.text === "string") output = log.text;
+      if (data && data.step) show(data.step, data.percent);
+      else showOutput();
     }
   })();
   try {
-    return await request();
+    const data = await request();
+    if (data) {
+      // The reply holds the whole output, including the last lines.
+      stepLine = data.ok === false ? "Failed." : "Done.";
+      output = data.output || output;
+      live = false;
+      showOutput();
+      saveState();
+    }
+    return data;
   } finally {
     live = false;
     const el = bar();
@@ -2761,6 +2791,10 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query or "")
             self.handle_update_progress((query.get("name") or [""])[0])
             return
+        if parsed.path == "/api/update-log":
+            query = parse_qs(parsed.query or "")
+            self.handle_update_log((query.get("name") or [""])[0])
+            return
         self.send_json(404, {"ok": False, "output": "Not found."})
 
     def do_POST(self):
@@ -2916,6 +2950,25 @@ class Handler(BaseHTTPRequestHandler):
             "step": step,
             "percent": min(int(percent), 100) if percent.isdigit() else None,
         })
+
+    # The most of an update's output the page is sent at once.
+    UPDATE_LOG_MAX = 256 * 1024
+
+    def handle_update_log(self, name):
+        """What a running or finished update has printed so far. Like the
+        progress, it reads the file modman writes instead of calling modman."""
+        if not LOG_NAME_RE.fullmatch(name) or not DATA_DIR:
+            self.send_json(400, {"ok": False, "output": "Bad name."})
+            return
+        try:
+            with open(os.path.join(DATA_DIR, f".update-log-{name}"), "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - self.UPDATE_LOG_MAX))
+                text = fh.read().decode("utf-8", "replace")
+        except OSError:
+            text = ""
+        self.send_json(200, {"ok": True, "text": text})
 
     def handle_props(self, name):
         try:
