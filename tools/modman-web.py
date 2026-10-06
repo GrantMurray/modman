@@ -560,7 +560,7 @@ APP_PAGE = r"""<!DOCTYPE html>
   .primary:hover:not(:disabled), .row-actions button[type="submit"]:hover:not(:disabled) { background: var(--accent-hover); }
   .danger { color: var(--bad); }
   .row-actions button.danger[type="submit"] { background: var(--bad); border-color: var(--bad); color: #fff; }
-  input[type="text"], input[type="search"], input[type="number"], select { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 7px; padding: 0.35rem 0.6rem; }
+  input[type="text"], input[type="search"], input[type="number"], input[type="url"], select { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 7px; padding: 0.35rem 0.6rem; }
   .muted { color: var(--muted); font-size: 0.9rem; }
 
   header { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: center; background: var(--brand); color: var(--brand-text); padding: 0.65rem 1.25rem; }
@@ -622,6 +622,7 @@ APP_PAGE = r"""<!DOCTYPE html>
   .loadbar { display: block; margin-top: 0.4rem; height: 0.25rem; background: var(--border); overflow: hidden; border-radius: 999px; }
   .loadbar[hidden] { display: none; }
   .loadbar span { display: block; height: 100%; width: 35%; background: var(--accent); animation: loadbar 1s ease-in-out infinite; }
+  .loadbar.known span { width: var(--pct, 0%); animation: none; transition: width 0.3s; }
   @keyframes loadbar { from { transform: translateX(-120%); } to { transform: translateX(320%); } }
 
   .console-panel { padding: 0.9rem; display: flex; flex-direction: column; gap: 0.55rem; min-width: 0; }
@@ -671,7 +672,7 @@ APP_PAGE = r"""<!DOCTYPE html>
   dialog p { margin: 0 0 0.75rem; }
   dialog label { display: block; margin: 0.6rem 0; }
   dialog [hidden] { display: none; }
-  dialog input[type="text"], dialog input[type="search"], dialog input[type="number"], dialog select { width: 100%; margin-top: 0.25rem; }
+  dialog input[type="text"], dialog input[type="search"], dialog input[type="number"], dialog input[type="url"], dialog select { width: 100%; margin-top: 0.25rem; }
   .dlg-msg { color: var(--bad); }
   .dlg-msg:empty { display: none; }
   .dlg-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.9rem; }
@@ -687,6 +688,8 @@ APP_PAGE = r"""<!DOCTYPE html>
   .results button { display: block; width: 100%; text-align: left; padding: 0.55rem 0.75rem; }
   .results button.on { outline: 2px solid var(--accent); }
   .upd-check { padding: 0.5rem 0.7rem; background: var(--surface-2); border-left: 3px solid var(--idle); border-radius: 0 6px 6px 0; }
+  .upd-source { display: flex; flex-wrap: wrap; gap: 0 1.2rem; }
+  .upd-source label { margin: 0.3rem 0; }
   .upd-check.warn { border-left-color: var(--warn); color: var(--warn); }
   .row-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
 
@@ -1102,7 +1105,7 @@ async function finishServer(name, label, request) {
   const note = toast(label || "Working…", "busy");
   let reached = false;
   try {
-    const data = await request();
+    const data = await request(note);
     reached = true;
     if (!data) {
       note.close();
@@ -1125,6 +1128,57 @@ async function finishServer(name, label, request) {
     else loadPacks(true);
     if (name) setServerBusy(name, false);
     else rowBusy = false;
+  }
+}
+
+// Steps a webpage update reports to /api/update-progress.
+const UPDATE_STEPS = {
+  start: "Preparing", check: "Checking CurseForge", stop: "Stopping the server",
+  download: "Downloading", unpack: "Unpacking", install: "Replacing files",
+};
+
+// Run an update request while polling its progress into the row's bar and
+// the busy note. A step without a percent keeps the moving bar.
+async function trackUpdate(name, note, request) {
+  let live = true;
+  const bar = () => {
+    const tr = [...document.querySelectorAll("#packs tr")].find((row) => row.dataset.name === name);
+    return tr && tr.querySelector(".loadbar");
+  };
+  const show = (step, pct) => {
+    const known = Number.isInteger(pct);
+    const el = bar();
+    if (el) {
+      el.classList.toggle("known", known);
+      el.style.setProperty("--pct", known ? `${pct}%` : "0%");
+      if (known) el.setAttribute("aria-valuenow", String(pct));
+      else el.removeAttribute("aria-valuenow");
+    }
+    note.update(`Updating ${name}: ${UPDATE_STEPS[step] || "Working"}${known ? ` ${pct}%` : "…"}`, "busy");
+  };
+  (async () => {
+    while (live) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (!live) return;
+      let data;
+      try {
+        data = await api(`/api/update-progress?name=${encodeURIComponent(name)}`);
+      } catch {
+        continue;
+      }
+      // The update may have finished while this poll was out.
+      if (live && data && data.step) show(data.step, data.percent);
+    }
+  })();
+  try {
+    return await request();
+  } finally {
+    live = false;
+    const el = bar();
+    if (el) {
+      el.classList.remove("known");
+      el.removeAttribute("aria-valuenow");
+    }
   }
 }
 
@@ -1231,7 +1285,7 @@ function rowMenuItems(pack) {
     if (up && main !== "restart") items.push(["restart", "Restart"]);
     if (up && main !== "stop") items.push(["stop", "Stop"]);
   }
-  items.push(["props", "Properties…"], ["port", "Change port…"], ["update", "Update…"]);
+  items.push(["props", "Properties…"], ["port", "Change port…"], ["version", "Set version…"], ["update", "Update…"]);
   if (pack.indexed) items.push(["disable", "Disable (move to Installed)"]);
   items.push("-", ["uninstall", "Uninstall…"]);
   return items;
@@ -1239,7 +1293,7 @@ function rowMenuItems(pack) {
 
 function metaText(pack) {
   const port = pack.port && pack.port !== "-" ? pack.port : "none";
-  return `Java ${javaText(pack)} · Port ${port}`;
+  return `Java ${javaText(pack)} · Port ${port}` + (pack.version ? ` · Version ${pack.version}` : "");
 }
 
 function row(pack) {
@@ -1263,7 +1317,7 @@ function row(pack) {
       <button type="button" data-act="${p.act}" data-primary class="${p.cls}">${p.label}</button>
       <button type="button" data-act="log">Log</button>
       <button type="button" class="more" data-act="more" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${esc(pack.name)}" title="More actions">&#8943;</button>
-    </div><span class="loadbar" hidden role="progressbar" aria-label="Working"><span></span></span></td>
+    </div><span class="loadbar" hidden role="progressbar" aria-label="Working" aria-valuemin="0" aria-valuemax="100"><span></span></span></td>
   </tr>`;
 }
 
@@ -1851,6 +1905,24 @@ function askPort(name, current) {
   input.select();
 }
 
+// The version is guessed on each install and update. This types it by hand
+// until the next one.
+function askVersion(name, current) {
+  ask(`<form>
+    <p>Set the version shown for <strong>${esc(name)}</strong>. The next install or update replaces it.</p>
+    <label>Version <input type="text" name="version" maxlength="64" value="${esc(current)}" placeholder="2.5.0" autocomplete="off" spellcheck="false" required></label>
+    <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Save</button></div>
+  </form>`, (fields) => {
+    const version = String(fields.version || "").trim();
+    if (!version) return;
+    dlg.close();
+    run({cmd: "version", name, version}, `Setting ${name} version to ${version}…`);
+  });
+  const input = dlg.querySelector("[name=version]");
+  input.focus();
+  input.select();
+}
+
 // anchor is the button the action came from, which a menu it opens hangs off.
 async function rowAction(act, name, anchor) {
   if (rowBusy) return;
@@ -1858,6 +1930,10 @@ async function rowAction(act, name, anchor) {
   if ((act === "start" || act === "stop" || act === "restart") && (!pack || !pack.indexed)) return;
   if (act === "port") {
     askPort(name, pack && pack.port !== "-" ? pack.port : "");
+    return;
+  }
+  if (act === "version") {
+    askVersion(name, (pack && pack.version) || "");
     return;
   }
   if (act === "props") {
@@ -1908,9 +1984,20 @@ async function rowAction(act, name, anchor) {
       <ul class="results" id="upd-results"></ul>
       <input type="hidden" name="mod_id" id="upd-id">`;
     ask(`<form>
-      <p>Update <strong>${esc(name)}</strong>.</p>
-      ${search}
-      <p id="upd-check" class="upd-check muted">${pack && pack.curseforge ? "Checking CurseForge…" : "Pick a modpack to see its newest version."}</p>
+      <p>Update <strong>${esc(name)}</strong> from:</p>
+      <div class="upd-source">
+        <label><input type="radio" name="source" value="curseforge" checked> CurseForge</label>
+        <label><input type="radio" name="source" value="link"> Download link</label>
+      </div>
+      <div id="upd-cf">
+        ${search}
+        <p id="upd-check" class="upd-check muted">${pack && pack.curseforge ? "Checking CurseForge…" : "Pick a modpack to see its newest version."}</p>
+      </div>
+      <div id="upd-link" hidden>
+        <p class="upd-check">Installed version: ${esc((pack && pack.version) || "unknown")}</p>
+        <label>Link to the server pack zip <input name="link" type="url" inputmode="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
+        <p class="muted">Google Drive, OneDrive, Dropbox, or any public https link to a zip. Anyone with the link must be able to download it. The server runs sandboxed, but only use packs you trust.</p>
+      </div>
       <label><input type="radio" name="world" value="keep" checked> Keep the world</label>
       <label><input type="radio" name="world" value="delete"> Delete the world</label>
       <label id="del-label" hidden>Type yes to delete the world <input name="delete_confirm" autocomplete="off"></label>
@@ -1918,7 +2005,9 @@ async function rowAction(act, name, anchor) {
       <p id="upd-msg" class="dlg-msg" role="alert"></p>
       <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit" id="upd-go" disabled>Update</button></div>
     </form>`, (fields) => {
-      if (!checked) return;
+      const fromLink = fields.source === "link";
+      const link = String(fields.link || "").trim();
+      if (!fromLink && !checked) return;
       const world = fields.world || "keep";
       if (String(fields.confirm).toLowerCase() !== "yes") { toast("Update cancelled.", "ok"); dlg.close(); return; }
       const updMsg = dlg.querySelector("#upd-msg");
@@ -1926,7 +2015,11 @@ async function rowAction(act, name, anchor) {
         updMsg.textContent = "Type yes to delete the world, or choose Keep the world.";
         return;
       }
-      if (!(pack && pack.curseforge) && !fields.mod_id) {
+      if (fromLink && !/^https:\/\/\S+$/i.test(link)) {
+        updMsg.textContent = "Enter one link that starts with https://";
+        return;
+      }
+      if (!fromLink && !(pack && pack.curseforge) && !fields.mod_id) {
         updMsg.textContent = "Choose a CurseForge modpack first.";
         return;
       }
@@ -1934,23 +2027,31 @@ async function rowAction(act, name, anchor) {
       const payload = {
         name, world,
         confirm: "yes",
-        delete_confirm: world === "delete" ? "yes" : "",
-        file: checked.file
+        delete_confirm: world === "delete" ? "yes" : ""
       };
-      if (fields.mod_id) payload.mod_id = fields.mod_id;
-      finishServer(name, `Updating ${name}…`, () => api("/api/update", payload));
+      if (fromLink) {
+        payload.link = link;
+      } else {
+        payload.file = checked.file;
+        if (fields.mod_id) payload.mod_id = fields.mod_id;
+      }
+      finishServer(name, `Updating ${name}…`, (note) => trackUpdate(name, note, () => api("/api/update", payload)));
     });
     // The Update button stays off until a check shows there is something to
     // install. The file it showed goes with the request, so the server refuses
     // if a newer release lands in between.
+    // A link has no version check, so Update turns on once one is typed.
     const checkLine = dlg.querySelector("#upd-check");
     const goBtn = dlg.querySelector("#upd-go");
+    const linkInput = dlg.querySelector('input[name="link"]');
+    const fromLink = () => dlg.querySelector('input[name="source"]:checked').value === "link";
+    const syncGo = () => { goBtn.disabled = fromLink() ? !linkInput.value.trim() : !checked; };
     let checked = null;
     let checkTicket = 0;
     const checkUpdate = async (modId) => {
       const ticket = ++checkTicket;
       checked = null;
-      goBtn.disabled = true;
+      syncGo();
       checkLine.className = "upd-check muted";
       checkLine.textContent = "Checking CurseForge…";
       let data;
@@ -1986,9 +2087,18 @@ async function rowAction(act, name, anchor) {
         checkLine.textContent = `Installed: ${installed} → Latest: ${latest}`;
         checked = data.latest;
       }
-      goBtn.disabled = !checked;
+      syncGo();
     };
     if (pack && pack.curseforge) checkUpdate("");
+    dlg.querySelectorAll('input[name="source"]').forEach((el) => {
+      el.onchange = () => {
+        dlg.querySelector("#upd-cf").hidden = fromLink();
+        dlg.querySelector("#upd-link").hidden = !fromLink();
+        if (fromLink()) linkInput.focus();
+        syncGo();
+      };
+    });
+    linkInput.oninput = syncGo;
     dlg.querySelectorAll('input[name="world"]').forEach((el) => {
       el.onchange = () => {
         dlg.querySelector("#del-label").hidden = dlg.querySelector('input[name="world"]:checked').value !== "delete";
@@ -2606,6 +2716,10 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query or "")
             self.handle_props((query.get("name") or [""])[0])
             return
+        if parsed.path == "/api/update-progress":
+            query = parse_qs(parsed.query or "")
+            self.handle_update_progress((query.get("name") or [""])[0])
+            return
         self.send_json(404, {"ok": False, "output": "Not found."})
 
     def do_POST(self):
@@ -2745,6 +2859,23 @@ class Handler(BaseHTTPRequestHandler):
             command,
         ], 30)
 
+    def handle_update_progress(self, name):
+        """The step a running update last reported. It reads the file modman
+        writes, since a modman call would wait behind the update itself."""
+        if not LOG_NAME_RE.fullmatch(name) or not DATA_DIR:
+            self.send_json(400, {"ok": False, "output": "Bad name."})
+            return
+        try:
+            with open(os.path.join(DATA_DIR, f".update-progress-{name}"), encoding="utf-8") as fh:
+                step, _, percent = fh.readline().strip().partition("\t")
+        except OSError:
+            step, percent = "", ""
+        self.send_json(200, {
+            "ok": True,
+            "step": step,
+            "percent": min(int(percent), 100) if percent.isdigit() else None,
+        })
+
     def handle_props(self, name):
         try:
             proc = modman_call(["props", name], 30)
@@ -2819,6 +2950,8 @@ class Handler(BaseHTTPRequestHandler):
             args.extend([name, str(body.get("port") or "")])
         elif cmd == "prop":
             args.extend([name, str(body.get("key") or ""), str(body.get("value") or "")])
+        elif cmd == "version":
+            args.extend([name, str(body.get("version") or "")])
         elif cmd == "uninstall":
             args.extend([name, str(body.get("confirm") or "")])
         elif cmd == "service":
@@ -2857,6 +2990,7 @@ class Handler(BaseHTTPRequestHandler):
             str(body.get("delete_confirm") or ""),
             str(body.get("mod_id") or ""),
             str(body.get("file") or ""),
+            str(body.get("link") or "").strip(),
         ], 3600)
 
     def handle_update_check(self, body):

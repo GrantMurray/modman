@@ -134,6 +134,8 @@ Each modpack is a folder under `/srv/minecraft`. The folder name is the name you
 
 `start.sh` has to be in that folder, and it has to be executable. modman runs `./start.sh` from the folder, inside a screen session. That script launches the Minecraft server. The mods, the server jar, and `eula.txt` stay in the pack for `start.sh` to use.
 
+Each server runs in a sandbox, because `start.sh` and the jars come from whoever made the pack. The server can write only its own folder. It cannot see your home folder (modman, its passwords, the CurseForge key) or any other pack, the rest of the system is read-only, and `sudo` does not work. So `start.sh` and Java have to live outside `/home`, for example Java under `/usr/lib/jvm`.
+
 `server.properties` holds the port on a `server-port=` line. `list` and `status` show that port, and the `port` command writes it. When the file or the line is missing, the port column shows `-`.
 
 `edit MyPack` lists every value in `server.properties` with a number. Type a number or a property name, then the new value. Settings that are true or false only take true or false, and whole-number settings only take whole numbers. Only existing settings can be changed, and the file is only there after the server has started once. A running server picks up the change after a restart. On the webpage, **Properties…** in each server's **⋯** menu does the same.
@@ -161,7 +163,7 @@ Servers listed in `data/index.txt` belong to the boot service (`mc-servers.servi
 
 `enable` and `disable` change that list. `disable` stops the server first if it is running, then takes it off the list. The server folder stays on disk.
 
-Run `service install`, then `service enable`, so those servers start again after a reboot.
+Run `service install`, then `service enable`, so those servers start again after a reboot. The service runs modman from its folder (`modman --boot`), so later changes to modman apply without installing again. Run `service install` again if you move the modman folder, or if you installed the service before this version, which used a copied helper in `/usr/local/bin`.
 
 ## See what is going on
 
@@ -218,7 +220,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 The page lists every modpack in two groups. **Active** holds the enabled servers, with their status, CPU, memory, and uptime. **Installed** holds the rest. Click the Installed heading to fold that list away. It starts folded on a phone, and the page remembers your choice in that browser.
 
-Each server has one main button for what you most likely want next: **Start** for a stopped server, **Stop** for a running one, **Restart** for one that hit an error, and **Enable** for an installed one. Beside it, **Log** shows that server's console, and **⋯** opens the rest: Restart, Properties… for `server.properties`, Change port…, Update…, Disable, and Uninstall…. Start, stop, and restart are only offered for enabled servers, so a one-off test of an installed server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running.
+Each server has one main button for what you most likely want next: **Start** for a stopped server, **Stop** for a running one, **Restart** for one that hit an error, and **Enable** for an installed one. Beside it, **Log** shows that server's console, and **⋯** opens the rest: Restart, Properties… for `server.properties`, Change port…, Set version…, Update…, Disable, and Uninstall…. A server's details line shows its version when one is known. Start, stop, and restart are only offered for enabled servers, so a one-off test of an installed server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running.
 
 The result of an action, such as stopping a modpack, shows as a note in the bottom corner. A note for an action that worked fades after a few seconds. An error stays until you close it. **Install modpack** opens a CurseForge search in its own window.
 
@@ -226,7 +228,7 @@ The console list has Actions plus each running server, and a server console keep
 
 The header shows whether the boot service is running and whether it starts at boot. The **Service** menu controls it. **Menu** has **Unlock page**, which cancels anything the page is waiting on and turns greyed-out buttons back on, and **Sign out**. The page follows the light or dark setting of your device.
 
-Update still asks whether to keep or delete the world. Choosing delete asks you to type yes.
+Update can use CurseForge or a download link, and still asks whether to keep or delete the world. Choosing delete asks you to type yes.
 
 The password has to be at least 4 characters. modman keeps a salted scrypt hash of it, never the password. A password saved by an older modman still works, but `web start` warns until you run `web password` again. One address gets 10 wrong passwords every 15 minutes. Behind a tunnel every visitor shares the tunnel's address, so wrong guesses from anyone can lock the page for 15 minutes. A sign-in lasts 7 days, or 12 hours without use.
 
@@ -304,7 +306,9 @@ If the pack has no `start.sh`, modman renames `run.sh` (or another launch script
 
 The CurseForge project id, and the server pack file id, are written to `.curseforge-id` in that folder so a later update can tell which project the folder came from.
 
-`update MyPack` installs a newer server pack into a folder that is already there. It first asks where the pack comes from: CurseForge (the default, press Enter), a download link such as Google Drive, OneDrive, or Dropbox, or a local zip file. A link must be shared so anyone with it can view the file, and must point at the zip, not a folder. Updating from a link or zip removes `.curseforge-id`, so a later CurseForge update searches for the project again. The webpage always updates from CurseForge. It then asks whether to keep or delete the world. Choosing delete asks you to type yes before the world, `world_nether`, and `world_the_end` are removed. `server.properties`, ops, whitelist, bans, and `eula.txt` stay either way. It then asks you to type yes before the update. A running server is stopped first. When the new pack has no `start.sh`, modman writes one the same way `install` does. For a CurseForge update, if the folder has no `.curseforge-id`, modman searches CurseForge using the folder name. When that search has no matches, it asks for a modpack name and lists results the same way `install` does.
+Each install and update also writes `.modman-version` in the folder, with the pack's version, where it came from (CurseForge, a link, or a zip), when it was installed, and for a link or zip the file's SHA-256. modman guesses the version from, in order: the CurseForge release name, the pack's own `config/bcc-common.toml` or `config/bcc.json`, its `manifest.json`, then a version number in the download's file name or the link. A number that only looks like a Minecraft version, such as 1.20.1, is skipped. When nothing fits, the version is unknown. `version MyPack 2.5.0` types it by hand, and the next install or update replaces it. `version` lists every pack's version, and `version MyPack` shows one pack's details.
+
+`update MyPack` installs a newer server pack into a folder that is already there. It first asks where the pack comes from: CurseForge (the default, press Enter), a download link such as Google Drive, OneDrive, or Dropbox, or a local zip file. A link must be shared so anyone with it can view the file, and must point at the zip, not a folder. Updating from a link or zip removes `.curseforge-id`, so a later CurseForge update searches for the project again. The webpage's **Update…** offers CurseForge or a download link. A link from the webpage must point at a public site; links to this machine or the local network are refused, including through redirects. Downloads over 2 GB, or zips that unpack to over 4 GB or hold over 100,000 files, are refused. It then asks whether to keep or delete the world. Choosing delete asks you to type yes before the world, `world_nether`, and `world_the_end` are removed. `server.properties`, ops, whitelist, bans, and `eula.txt` stay either way. It then asks you to type yes before the update. A running server is stopped first. When the new pack has no `start.sh`, modman writes one the same way `install` does. For a CurseForge update, if the folder has no `.curseforge-id`, modman searches CurseForge using the folder name. When that search has no matches, it asks for a modpack name and lists results the same way `install` does.
 
 ## Change a server
 
@@ -317,6 +321,7 @@ The CurseForge project id, and the server pack file id, are written to `.cursefo
 | `uninstall MyPack` | Asks you to type yes, then deletes that server folder. Stops it first if it is running, and takes it out of the index if it was listed |
 | `rename MyPack MyPack2` | Renames the folder and updates the index if that server was listed |
 | `port MyPack 25570` | Sets that server's port in `server.properties` |
+| `version` / `version MyPack` / `version MyPack 2.5.0` | Lists every pack's version, shows one pack's details, or types a pack's version by hand |
 
 `port` works whether or not the server is in the index. The new port is used the next time that server starts.
 

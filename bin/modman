@@ -9,7 +9,8 @@ HISTORY_FILE="${ROOT_DIR}/data/.modman_history"
 MINECRAFT_ROOT="/srv/minecraft"
 SYSTEMD_SERVICE="mc-servers.service"
 SYSTEMD_UNIT="/etc/systemd/system/${SYSTEMD_SERVICE}"
-SYSTEMD_HELPER="/usr/local/bin/start_mc_servers"
+# Older installs copied a helper here. service install removes it.
+OLD_SYSTEMD_HELPER="/usr/local/bin/start_mc_servers"
 WEB_PORT=8787
 WEB_HTTP_PORT=8788
 WEB_STATE_FILE="${ROOT_DIR}/data/.modman-web.state"
@@ -70,6 +71,7 @@ Commands:
   rename OLD NEW             Rename a modpack dir and update the index if present
   port MODPACK PORT          Set a modpack's server-port in server.properties
   edit MODPACK               List server.properties values and change one
+  version [MODPACK [VERSION]] Show every pack's version, one pack's details, or type a pack's version
   web start                  Start https and http with the saved password
   web stop                   Stop the control page
   web restart                Stop the page, then start it again
@@ -108,6 +110,8 @@ Examples:
   rename MonkeyMine MonkeyMine2
   port Cobbleverse 25570
   edit Linggango-HugeUpdate
+  version
+  version Cobbleverse 2.5.0
   web start
   web status
   web stop
@@ -221,6 +225,19 @@ get_java_version() {
 	if [[ "$bin" != "java" && "$bin" != /*/java ]]; then
 		printf '%s' "-"
 		return 0
+	fi
+	# start.sh comes from the pack and can name any file. This runs outside
+	# the sandbox, so it only runs a java that root installed, never one in a
+	# pack folder.
+	if [[ "$bin" == /* ]]; then
+		local real
+		real="$(realpath -e -- "$bin" 2>/dev/null)" || real=""
+		if [[ -z "$real" || "$real" == "$(realpath -m -- "$MINECRAFT_ROOT")"/* ||
+			"$(stat -c %u -- "$real" 2>/dev/null)" != "0" ]]; then
+			printf '%s' "-"
+			return 0
+		fi
+		bin="$real"
 	fi
 
 	if [[ ! -v JAVA_VERSION_CACHE ]]; then
@@ -719,6 +736,21 @@ pack_stays_inside() {
 	return 0
 }
 
+# Write stdin to FILE in a pack folder. The server can write its own folder
+# and could leave a symlink under that name, pointing at a file of yours. So
+# this writes a new file and renames it over the name, which replaces a link
+# instead of following it.
+pack_file_write() {
+	local pack_dir="$1"
+	local file="$2"
+	local tmp
+	tmp="$(mktemp "$pack_dir/.${file#.}.XXXXXX")" || return 1
+	if ! cat >"$tmp" || ! chmod 644 "$tmp" || ! mv -f -T "$tmp" "$pack_dir/$file"; then
+		rm -f "$tmp"
+		return 1
+	fi
+}
+
 require_modpack() {
 	local name="$1"
 	if ! valid_modpack_name "$name"; then
@@ -812,6 +844,7 @@ rename_modpack() {
 set_port() {
 	local name="${1:-}"
 	local port="${2:-}"
+	local status=0
 
 	if [[ -z "$name" || -z "$port" ]]; then
 		echo "Error: port requires MODPACK and PORT." >&2
@@ -831,25 +864,31 @@ set_port() {
 	fi
 
 	local props="$pack_dir/server.properties"
-	local old_port
+	local old_port tmp
+	if [[ -L "$props" ]]; then
+		echo "Error: $props is a symlink, so modman will not change it." >&2
+		return 1
+	fi
 	old_port="$(get_port "$name")"
 
+	# Build the new file aside, then put it in place in one step.
+	tmp="$(mktemp)"
 	if [[ -f "$props" ]] && grep -qE '^[[:space:]]*server-port=' "$props"; then
-		local tmp
-		tmp="$(mktemp)"
-		sed -E "s/^[[:space:]]*server-port=.*/server-port=${port}/" "$props" >"$tmp"
-		if ! cat "$tmp" >"$props"; then
-			rm -f "$tmp"
-			echo "Error: failed to write $props (permission denied?)." >&2
-			return 1
-		fi
-		rm -f "$tmp"
+		sed -E "s/^[[:space:]]*server-port=.*/server-port=${port}/" "$props" >"$tmp" || status=1
 	else
-		if ! printf 'server-port=%s\n' "$port" >>"$props"; then
-			echo "Error: failed to write $props (permission denied?)." >&2
-			return 1
-		fi
+		{
+			if [[ -f "$props" ]]; then
+				cat -- "$props"
+			fi
+			printf 'server-port=%s\n' "$port"
+		} >"$tmp" || status=1
 	fi
+	if ((status)) || ! pack_file_write "$pack_dir" server.properties <"$tmp"; then
+		rm -f "$tmp"
+		echo "Error: failed to write $props (permission denied?)." >&2
+		return 1
+	fi
+	rm -f "$tmp"
 
 	if [[ "$old_port" == "-" ]]; then
 		echo "Set '$name' server-port to $port ($props)"
@@ -972,8 +1011,7 @@ PY
 		echo "Error: failed to read $props" >&2
 		return 1
 	fi
-	# cat into the file keeps its owner and permissions.
-	if ! cat "$tmp" >"$props"; then
+	if ! pack_file_write "$(dirname -- "$props")" server.properties <"$tmp"; then
 		rm -f "$tmp"
 		echo "Error: failed to write $props (permission denied?)." >&2
 		return 1
@@ -1204,14 +1242,20 @@ show_usage() {
 	print_usage_table "${INDEX_ENTRIES[@]}"
 }
 
+# Every server starts here, from the shell, the webpage, and the boot service.
 # The webpage service kills every process in its control group when it
 # restarts. A screen started there dies with it. The user service manager
 # is outside that group, so the screen keeps running.
+#
+# The unit is also a sandbox, because start.sh and the jars come from the
+# pack. It sees /home as empty (no modman code, keys, or hashes), the rest of
+# the system read-only, and no other pack. It can write only its own folder
+# and the screen socket directory, and cannot gain privileges through sudo.
 launch_server_screen() {
 	local name="$1"
 	local session="$2"
 	local pack_dir="$3"
-	local unit runtime bus quoted
+	local unit runtime bus quoted screen_dir
 
 	if ! command -v systemd-run >/dev/null 2>&1; then
 		echo "Error: systemd-run is not installed, so '$name' was not started." >&2
@@ -1230,12 +1274,26 @@ launch_server_screen() {
 	export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 	systemctl --user reset-failed "${unit}.service" >/dev/null 2>&1 || true
 
+	# screen cannot create its socket directory once /run is read-only.
+	screen_dir="${SCREENDIR:-/run/screen/S-$(id -un)}"
+	if ! mkdir -p -m 700 "$screen_dir"; then
+		echo "Error: cannot create $screen_dir, so '$name' was not started." >&2
+		return 1
+	fi
+
 	quoted="$(printf '%q' "$pack_dir")"
 	systemd-run --user --collect --quiet \
 		--expand-environment=no \
 		--unit="$unit" \
 		--property=Type=exec \
 		--description="Minecraft server ${name}" \
+		--property=NoNewPrivileges=yes \
+		--property=ProtectHome=tmpfs \
+		--property=ProtectSystem=strict \
+		--property=PrivateTmp=yes \
+		--property=TemporaryFileSystem="$MINECRAFT_ROOT" \
+		--property=BindPaths="$pack_dir" \
+		--property=ReadWritePaths="$screen_dir" \
 		-- \
 		screen -DmS "$session" bash -c "cd ${quoted} && ./start.sh" \
 		|| return 1
@@ -1246,7 +1304,7 @@ MINECRAFT_EULA_URL="https://aka.ms/MinecraftEULA"
 # True when the pack's eula.txt has eula=true.
 eula_accepted() {
 	local pack_dir="$1"
-	[[ -f "$pack_dir/eula.txt" ]] &&
+	[[ -f "$pack_dir/eula.txt" && ! -L "$pack_dir/eula.txt" ]] &&
 		grep -qiE '^[[:space:]]*eula[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$pack_dir/eula.txt"
 }
 
@@ -1263,15 +1321,29 @@ EOF
 accept_eula() {
 	local pack_dir="$1"
 	local file="$pack_dir/eula.txt"
+	local tmp status=0
+	if [[ -L "$file" ]]; then
+		echo "Error: $file is a symlink, so modman will not change it." >&2
+		return 1
+	fi
+	tmp="$(mktemp)"
 	if [[ -f "$file" ]] && grep -qiE '^[[:space:]]*eula[[:space:]]*=' "$file"; then
-		sed -i -E 's/^[[:space:]]*eula[[:space:]]*=.*/eula=true/I' "$file" || return 1
+		sed -E 's/^[[:space:]]*eula[[:space:]]*=.*/eula=true/I' "$file" >"$tmp" || status=1
 	else
 		{
+			if [[ -f "$file" ]]; then
+				cat -- "$file"
+			fi
 			printf '#By changing the setting below to TRUE you are indicating your agreement to our EULA (%s).\n' "$MINECRAFT_EULA_URL"
 			printf '#%s\n' "$(date)"
 			printf 'eula=true\n'
-		} >>"$file" || return 1
+		} >"$tmp" || status=1
 	fi
+	if ((status)) || ! pack_file_write "$pack_dir" eula.txt <"$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	rm -f "$tmp"
 }
 
 # Make sure the EULA is accepted before a start. Asks at the prompt; a web call
@@ -1337,11 +1409,7 @@ start_one() {
 
 	ensure_eula "$name" || return
 
-	if [[ -n "${MODMAN_WEB_CALL:-}" ]]; then
-		launch_server_screen "$name" "$session" "$pack_dir" || return 1
-	else
-		screen -dmS "$session" bash -c "cd \"$pack_dir\" && ./start.sh"
-	fi
+	launch_server_screen "$name" "$session" "$pack_dir" || return 1
 	echo "Started '$name' in screen $session."
 }
 
@@ -1579,9 +1647,26 @@ install_system_file() {
 	return 1
 }
 
+# Remove a file installed by install_system_file, using sudo when needed.
+remove_system_file() {
+	local path="$1"
+	[[ -e "$path" || -L "$path" ]] || return 0
+	if [[ -w "$(dirname "$path")" ]]; then
+		rm -f "$path"
+		return
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		sudo rm -f "$path"
+		return
+	fi
+	echo "Error: cannot remove $path and sudo is unavailable." >&2
+	return 1
+}
+
 service_install() {
-	local user helper_src helper_tmp unit_tmp
+	local user uid modman_path unit_tmp
 	user="$(service_user)" || return 1
+	uid="$(id -u "$user")" || return 1
 
 	if [[ ! -d "$MINECRAFT_ROOT" ]]; then
 		echo "Error: modpack root not found: $MINECRAFT_ROOT" >&2
@@ -1591,55 +1676,55 @@ service_install() {
 		echo "Error: screen is not installed." >&2
 		return 1
 	fi
-	if ! command -v systemctl >/dev/null 2>&1; then
-		echo "Error: systemctl is not available." >&2
+	if ! command -v systemctl >/dev/null 2>&1 || ! command -v systemd-run >/dev/null 2>&1; then
+		echo "Error: systemctl and systemd-run are needed." >&2
 		return 1
 	fi
 
-	helper_src="${TOOLS_DIR}/start_mc_servers"
-	if [[ ! -f "$helper_src" ]]; then
-		echo "Error: missing helper script: $helper_src" >&2
+	# The unit runs this copy of modman in place, so later changes to it
+	# reach the boot service without installing again.
+	modman_path="$(realpath -e -- "${BASH_SOURCE[0]}")" || return 1
+	if [[ "$modman_path" == *[\"\\[:cntrl:]]* ]]; then
+		echo "Error: cannot use $modman_path in a unit file. Move modman to a plainer path." >&2
 		return 1
 	fi
+	# A literal % in a unit file is written %%.
+	modman_path="${modman_path//%/%%}"
 
 	echo "Installing $SYSTEMD_SERVICE for user $user..."
 
-	helper_tmp="$(mktemp "${TMPDIR:-/tmp}/start_mc_servers.XXXXXX")"
 	unit_tmp="$(mktemp "${TMPDIR:-/tmp}/mc-servers.service.XXXXXX")"
 	# shellcheck disable=SC2064
-	trap "rm -f $(printf '%q' "$helper_tmp") $(printf '%q' "$unit_tmp")" RETURN
-
-	sed \
-		-e "s|__INDEX_FILE__|${INDEX_FILE}|g" \
-		-e "s|__MINECRAFT_ROOT__|${MINECRAFT_ROOT}|g" \
-		"$helper_src" >"$helper_tmp"
-	chmod 755 "$helper_tmp"
+	trap "rm -f $(printf '%q' "$unit_tmp")" RETURN
 
 	cat >"$unit_tmp" <<EOF
 [Unit]
 Description=Start minecraft servers in seperate screens
-After=network.target
+# Servers run under ${user}'s service manager, which must be up first.
+Wants=user@${uid}.service
+After=network.target user@${uid}.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 User=${user}
-ExecStart=${SYSTEMD_HELPER}
+ExecStart="${modman_path}" --boot
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-	if ! install_system_file "$helper_tmp" "$SYSTEMD_HELPER"; then
-		return 1
-	fi
 	if ! install_system_file "$unit_tmp" "$SYSTEMD_UNIT"; then
 		return 1
 	fi
-
 	echo "Installed $SYSTEMD_UNIT (User=$user)."
-	echo "Installed $SYSTEMD_HELPER."
+	if [[ -e "$OLD_SYSTEMD_HELPER" ]] && remove_system_file "$OLD_SYSTEMD_HELPER"; then
+		echo "Removed the old helper $OLD_SYSTEMD_HELPER."
+	fi
 	run_systemctl daemon-reload || return 1
+	if [[ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null)" != "yes" ]]; then
+		echo "Warning: ${user}'s service manager does not start at boot, so servers will not either. Run: sudo loginctl enable-linger ${user}" >&2
+	fi
 	echo "$SYSTEMD_SERVICE installed. It was not enabled or started."
 	echo "Run 'service enable' to start it at boot, or 'service start' to start it now."
 }
@@ -1885,6 +1970,239 @@ print(f"{name}\x1f{date}\x1f{parent}")
 	cut -d $'\x1f' -f1,2 <<<"$body"
 }
 
+# .modman-version in a pack folder records what was installed there:
+#   version    release name or number, empty when unknown
+#   source     curseforge, link, or zip
+#   from       the CurseForge project id, the link, or the zip's file name
+#   installed  when modman installed it, in UTC
+#   sha256     the zip's hash, for a link or zip
+#   edited     when the version was last typed with the version command
+PACK_VERSION_FILE=".modman-version"
+PACK_VERSION_MAX=64
+
+# One line of text: control characters become spaces, ends are trimmed.
+version_clean() {
+	local value="${1//[[:cntrl:]]/ }"
+	value="${value#"${value%%[![:space:]]*}"}"
+	value="${value%"${value##*[![:space:]]}"}"
+	printf '%s' "$value"
+}
+
+# Sets PV_VERSION, PV_SOURCE, PV_FROM, PV_INSTALLED, PV_SHA, and PV_EDITED for
+# a pack folder. A pack from before .modman-version falls back to the release
+# name saved in .curseforge-id.
+read_pack_version() {
+	local dest="$1"
+	local file="$dest/$PACK_VERSION_FILE" line picked
+	PV_VERSION="" PV_SOURCE="" PV_FROM="" PV_INSTALLED="" PV_SHA="" PV_EDITED=""
+	if [[ -f "$file" && ! -L "$file" ]]; then
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			case "$line" in
+			version=*) PV_VERSION="${line#version=}" ;;
+			source=*) PV_SOURCE="${line#source=}" ;;
+			from=*) PV_FROM="${line#from=}" ;;
+			installed=*) PV_INSTALLED="${line#installed=}" ;;
+			sha256=*) PV_SHA="${line#sha256=}" ;;
+			edited=*) PV_EDITED="${line#edited=}" ;;
+			esac
+		done < <(head -c 8192 "$file")
+		PV_VERSION="$(version_clean "$PV_VERSION")"
+		PV_VERSION="${PV_VERSION:0:PACK_VERSION_MAX}"
+		return 0
+	fi
+	if picked="$(read_curseforge_id "$dest/.curseforge-id" 2>/dev/null)"; then
+		IFS=$'\x1f' read -r PV_FROM _ PV_VERSION _ <<<"$picked"
+		PV_VERSION="$(version_clean "$PV_VERSION")"
+		PV_SOURCE="curseforge"
+	fi
+}
+
+# Write .modman-version from the PV_ values.
+save_pack_version() {
+	local dest="$1"
+	if ! printf 'version=%s\nsource=%s\nfrom=%s\ninstalled=%s\nsha256=%s\nedited=%s\n' \
+		"$(version_clean "$PV_VERSION")" "$(version_clean "$PV_SOURCE")" "$(version_clean "$PV_FROM")" \
+		"$PV_INSTALLED" "$PV_SHA" "$PV_EDITED" | pack_file_write "$dest" "$PACK_VERSION_FILE"; then
+		echo "Error: could not write $dest/$PACK_VERSION_FILE" >&2
+		return 1
+	fi
+}
+
+# Record a fresh install or update. Prints the version line for the user.
+record_pack_version() {
+	local name="$1"
+	PV_VERSION="$(version_clean "$2")"
+	PV_VERSION="${PV_VERSION:0:PACK_VERSION_MAX}"
+	PV_SOURCE="$3"
+	PV_FROM="$4"
+	PV_SHA="${5:-}"
+	PV_INSTALLED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	PV_EDITED=""
+	# A pack that installed fine is not undone because this note failed.
+	save_pack_version "${MINECRAFT_ROOT}/${name}" || true
+	if [[ -n "$PV_VERSION" ]]; then
+		echo "Version: ${PV_VERSION}"
+	else
+		echo "Version unknown. Set it with: version ${name} <version>"
+	fi
+}
+
+# Guess a pack's version. Tries a number in FIRST (the CurseForge release
+# name), then the pack's own config/bcc-common.toml or config/bcc.json, then
+# manifest.json, then a number in each LATER name (a download's
+# Content-Disposition, its link, or a zip's file name). Prints nothing when
+# none is found.
+detect_pack_version() {
+	python3 - "$PACK_VERSION_MAX" "$@" <<'PY' 2>/dev/null || true
+import json, os, re, sys
+from urllib.parse import unquote, urlsplit
+
+limit, root, first, later = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4:]
+
+def clean(value):
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).strip()[:limit]
+
+def name_of(hint):
+    """The file name in a Content-Disposition value, a link, or a path."""
+    m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;]+)", hint, re.I)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"([^"]*)"', hint, re.I) or re.search(r"filename\s*=\s*([^;]+)", hint, re.I)
+    if m:
+        return m.group(1).strip()
+    if "://" in hint:
+        return unquote(os.path.basename(urlsplit(hint).path))
+    return os.path.basename(hint)
+
+# Minecraft's own versions show up in pack names too, as in Pack-1.20.1-2.5.0.
+MINECRAFT = re.compile(r"1\.(?:[7-9]|1\d|2[0-9])(?:\.\d{1,2})?")
+NUMBER = re.compile(r"(?<![\w.])(?:v(\d+(?:\.\d+)*[a-z]?)|(\d+(?:\.\d+)+[a-z]?))(?![\w.])", re.I)
+
+def number_in(hint):
+    name = re.sub(r"\.(zip|jar|7z|tar\.gz)$", "", name_of(hint), flags=re.I)
+    tokens = [a or b for a, b in NUMBER.findall(re.sub(r"[-_+()\[\]]", " ", name))]
+    tokens = [t for t in tokens if not MINECRAFT.fullmatch(t)]
+    return tokens[-1] if tokens else ""
+
+def read(rel, size=1 << 20):
+    path = os.path.join(root, rel)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read(size)
+
+def from_pack():
+    m = re.search(r'^\s*modpackVersion\s*=\s*"([^"]*)"', read("config/bcc-common.toml"), re.M)
+    if m and m.group(1).strip():
+        return m.group(1)
+    for rel, ok in (("config/bcc.json", lambda d: True),
+                    ("manifest.json", lambda d: "minecraft" in d or "manifestType" in d)):
+        try:
+            data = json.loads(read(rel) or "{}")
+        except ValueError:
+            continue
+        if isinstance(data, dict) and ok(data):
+            value = data.get("modpackVersion") if rel.startswith("config") else data.get("version")
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return str(value)
+    return ""
+
+def candidates():
+    if first:
+        yield number_in(first)
+    yield from_pack()
+    for hint in later:
+        if hint:
+            yield number_in(hint)
+
+for value in candidates():
+    value = clean(value)
+    if value:
+        print(value)
+        break
+PY
+}
+
+# version: every pack's version. version MODPACK: one pack's details.
+# version MODPACK VERSION...: type the version by hand. The next install or
+# update replaces it.
+pack_version_command() {
+	local name="${1:-}"
+	local dest width when
+	if [[ -z "$name" ]]; then
+		local -a names=()
+		mapfile -t names < <(all_modpack_names || true)
+		if ((${#names[@]} == 0)); then
+			echo "No modpacks under $MINECRAFT_ROOT"
+			return 0
+		fi
+		width="$(max_name_width "${names[@]}")"
+		print_table_header "$(printf "%-${width}s  %-24s  %s" "MODPACK" "VERSION" "SOURCE")"
+		for name in "${names[@]}"; do
+			pack_stays_inside "$name" || continue
+			read_pack_version "$MINECRAFT_ROOT/$name"
+			printf "%-${width}s  %-24s  %s\n" "$name" "${PV_VERSION:--}" \
+				"${PV_SOURCE:--}${PV_EDITED:+ (typed)}"
+		done
+		return 0
+	fi
+	require_modpack "$name" || return 1
+	dest="$MINECRAFT_ROOT/$name"
+	if [[ ! -d "$dest" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if (($# > 1)); then
+		set_pack_version "$name" "${*:2}"
+		return
+	fi
+	read_pack_version "$dest"
+	if [[ -z "$PV_VERSION$PV_SOURCE" ]]; then
+		echo "No version saved for '$name'. Set it with: version $name <version>"
+		return 0
+	fi
+	echo "Version:   ${PV_VERSION:-unknown}${PV_EDITED:+ (typed by hand)}"
+	case "$PV_SOURCE" in
+	curseforge) echo "Source:    CurseForge project ${PV_FROM:-unknown}" ;;
+	link) echo "Source:    download link ${PV_FROM}" ;;
+	zip) echo "Source:    zip file ${PV_FROM}" ;;
+	"") ;;
+	*) echo "Source:    ${PV_SOURCE}" ;;
+	esac
+	if [[ -n "$PV_INSTALLED" ]]; then
+		when="$(date -d "$PV_INSTALLED" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || printf '%s' "$PV_INSTALLED")"
+		echo "Installed: ${when}"
+	fi
+	[[ -n "$PV_SHA" ]] && echo "SHA-256:   ${PV_SHA}"
+	return 0
+}
+
+# Type a pack's version by hand. The source and install details stay.
+set_pack_version() {
+	local name="${1:-}"
+	local version dest
+	version="$(version_clean "${2:-}")"
+	require_modpack "$name" || return 1
+	dest="$MINECRAFT_ROOT/$name"
+	if [[ ! -d "$dest" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	if [[ -z "$version" ]]; then
+		echo "Error: type a version, such as 2.5.0." >&2
+		return 1
+	fi
+	if ((${#version} > PACK_VERSION_MAX)); then
+		echo "Error: the version can be at most ${PACK_VERSION_MAX} characters." >&2
+		return 1
+	fi
+	read_pack_version "$dest"
+	PV_VERSION="$version"
+	PV_EDITED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	save_pack_version "$dest" || return 1
+	echo "Set '${name}' to version ${version}."
+}
+
 # Write .curseforge-id for a pack folder.
 write_curseforge_id() {
 	local dest="$1"
@@ -1893,7 +2211,7 @@ write_curseforge_id() {
 	local version="$4"
 	local date="$5"
 	if ! printf 'id=%s\nfile=%s\nversion=%s\ndate=%s\n' \
-		"$mod_id" "$file_id" "$version" "$date" >"$dest/.curseforge-id"; then
+		"$mod_id" "$file_id" "$version" "$date" | pack_file_write "$dest" .curseforge-id; then
 		echo "Error: failed to write $dest/.curseforge-id" >&2
 		return 1
 	fi
@@ -1933,20 +2251,87 @@ PY
 }
 
 # Unpack a server-pack zip and print the pack directory.
+# A webpage update reports its step to MODMAN_PROGRESS_FILE, which the page
+# polls: the step, a tab, then a percent or "-" when it is not known.
+progress() {
+	[[ -n "${MODMAN_PROGRESS_FILE:-}" ]] || return 0
+	# Progress is only shown, so a failed write never stops the update.
+	{ printf '%s\t%s\n' "$1" "${2:--}" >"${MODMAN_PROGRESS_FILE}.tmp" &&
+		mv -f "${MODMAN_PROGRESS_FILE}.tmp" "$MODMAN_PROGRESS_FILE"; } 2>/dev/null || true
+}
+
+# Read curl's -# meter and report its percent. Other lines, such as curl's
+# errors, go on to stderr.
+curl_progress() {
+	local chunk line pct last=""
+	while IFS= read -r -d $'\r' chunk || [[ -n "$chunk" ]]; do
+		while IFS= read -r line; do
+			if [[ "$line" =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then
+				pct="${BASH_REMATCH[1]}"
+				if [[ "$pct" != "$last" ]]; then
+					progress download "$pct"
+					last="$pct"
+				fi
+			elif [[ "$line" == *curl:* ]]; then
+				printf '%s\n' "curl:${line#*curl:}" >&2
+			fi
+		done <<<"$chunk"
+	done
+}
+
+# curl with its -# meter. A webpage update sends the meter to the progress
+# file instead of the terminal. Takes curl's arguments.
+curl_meter() {
+	if [[ -z "${MODMAN_PROGRESS_FILE:-}" ]]; then
+		curl -# "$@"
+		return
+	fi
+	local status
+	progress download
+	{
+		curl -# "$@" 2>&1 1>&3 3>&- | curl_progress
+		status="${PIPESTATUS[0]}"
+	} 3>&1
+	return "$status"
+}
+
 cf_extract_root() {
 	local zip="$1"
 	local dest="$2"
-	python3 - "$zip" "$dest" <<'PY'
+	python3 - "$zip" "$dest" "$PACK_MAX_UNPACKED" "$PACK_MAX_FILES" <<'PY'
 import os, sys, zipfile
 zip_path, dest = sys.argv[1], sys.argv[2]
+max_unpacked, max_files = int(sys.argv[3]), int(sys.argv[4])
 with zipfile.ZipFile(zip_path) as zf:
-    for info in zf.infolist():
+    infos = zf.infolist()
+    if len(infos) > max_files:
+        sys.stderr.write(f"Error: the archive has more than {max_files} files.\n")
+        sys.exit(1)
+    # zipfile stops each file at its listed size, so the total holds.
+    if sum(info.file_size for info in infos) > max_unpacked:
+        sys.stderr.write(f"Error: the archive unpacks to more than {max_unpacked // 1024**3} GB.\n")
+        sys.exit(1)
+    for info in infos:
         name = info.filename.replace("\\", "/")
         parts = [p for p in name.split("/") if p not in ("", ".")]
         if name.startswith("/") or any(p == ".." for p in parts):
             sys.stderr.write(f"Error: archive path escapes the pack: {info.filename}\n")
             sys.exit(1)
-    zf.extractall(dest)
+    progress_file = os.environ.get("MODMAN_PROGRESS_FILE", "")
+    total = sum(info.file_size for info in infos)
+    done, last = 0, -1
+    for info in infos:
+        zf.extract(info, dest)
+        done += info.file_size
+        pct = done * 100 // total if total else 100
+        if progress_file and pct != last:
+            last = pct
+            try:
+                with open(progress_file + ".tmp", "w") as fh:
+                    fh.write(f"unpack\t{pct}\n")
+                os.replace(progress_file + ".tmp", progress_file)
+            except OSError:
+                pass
 
 HINTS = {"start.sh", "run.sh", "startserver.sh", "start_server.sh", "serverstart.sh", "server.jar", "user_jvm_args.txt"}
 
@@ -2157,7 +2542,7 @@ PY
 	url="$(cf_download_url "$key" "$mod_id" "$parent")" || return 1
 	zip="${work}/client.zip"
 	echo "Reading the mod loader version from the client pack..." >&2
-	if ! curl -fL --proto =https --retry 2 -A modman -o "$zip" -# "$url"; then
+	if ! curl_meter -fL --proto =https --retry 2 -A modman -o "$zip" "$url"; then
 		echo "Error: client pack download failed." >&2
 		return 1
 	fi
@@ -2219,7 +2604,7 @@ for item in json.load(sys.stdin):
 		;;
 	esac
 	echo "The server pack ships no launcher. Downloading ${loader} ${version} for Minecraft ${mc}..." >&2
-	if ! curl -fL --proto =https --retry 2 -A modman -o "${root}/${out}" -# "$url"; then
+	if ! curl_meter -fL --proto =https --retry 2 -A modman -o "${root}/${out}" "$url"; then
 		rm -f "${root}/${out}"
 		echo "Error: ${loader} download failed." >&2
 		return 1
@@ -2350,7 +2735,7 @@ cf_select_modpack() {
 read_curseforge_id() {
 	local file="$1"
 	local line id="" file_id="" version="" date=""
-	[[ -f "$file" ]] || return 2
+	[[ -f "$file" && ! -L "$file" ]] || return 2
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		case "$line" in
 			id=*) id="${line#id=}" ;;
@@ -2385,7 +2770,7 @@ cf_stage_server_pack() {
 	work="$(mktemp -d)"
 	zip="${work}/pack.zip"
 	# The download host is CurseForge's file CDN, which does not need the key.
-	if ! curl -fL --proto =https --retry 2 -A modman -o "$zip" -# "$url"; then
+	if ! curl_meter -fL --proto =https --retry 2 -A modman -o "$zip" "$url"; then
 		rm -rf "$work"
 		echo "Error: download failed." >&2
 		return 1
@@ -2578,6 +2963,7 @@ install_chosen_modpack() {
 	local key folder dest
 	local file_id meta display versions release release_name release_date
 	local staged work root generated status=0
+	local new_version="" zip_sha="" hint_disposition="" hint_name=""
 
 	if [[ ! "$mod_id" =~ ^[0-9]+$ ]]; then
 		echo "Error: bad CurseForge project id." >&2
@@ -2621,6 +3007,8 @@ install_chosen_modpack() {
 		IFS= read -r root
 		IFS= read -r generated
 	} <<<"$staged"
+	new_version="$(detect_pack_version "$root" "$release_name")"
+	new_version="${new_version:-${release_name:-$display}}"
 	if ! mkdir "$dest"; then
 		rm -rf "$work"
 		echo "Error: failed to create $dest" >&2
@@ -2644,6 +3032,7 @@ install_chosen_modpack() {
 	fi
 
 	echo "Installed ${mod_name} in ${dest}"
+	record_pack_version "$folder" "$new_version" curseforge "$mod_id"
 	if [[ "$generated" == "generated" ]]; then
 		echo "Wrote start.sh; the server pack did not include one."
 	elif [[ "$generated" == renamed\ * ]]; then
@@ -2758,13 +3147,107 @@ else:
 PY
 }
 
+# Limits for a server pack from a link. /tmp is often in memory, so one link
+# cannot fill it.
+PACK_MAX_DOWNLOAD=$((2 * 1024 * 1024 * 1024))
+PACK_MAX_UNPACKED=$((4 * 1024 * 1024 * 1024))
+PACK_MAX_FILES=100000
+
+# Check one https link before it is fetched. A webpage call must point at a
+# public address, so the page cannot reach machines on this network. Then it
+# prints host:port:address for curl --resolve, so the host cannot change
+# address between this check and the download.
+link_target() {
+	python3 - "$1" "${MODMAN_WEB_CALL:+public}" <<'PY'
+import ipaddress, socket, sys
+from urllib.parse import urlsplit
+url, public = sys.argv[1], sys.argv[2] == "public"
+try:
+    parts = urlsplit(url)
+    scheme, host, port = parts.scheme, parts.hostname, parts.port or 443
+except ValueError:
+    scheme = host = None
+if scheme != "https" or not host:
+    sys.stderr.write("Error: the link must start with https://\n")
+    sys.exit(1)
+if not public:
+    sys.exit(0)
+try:
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+except (OSError, UnicodeError):
+    sys.stderr.write(f"Error: cannot find the host {host}.\n")
+    sys.exit(1)
+addrs = []
+for info in infos:
+    addr = ipaddress.ip_address(info[4][0].split("%")[0])
+    addr = getattr(addr, "ipv4_mapped", None) or addr
+    if not addr.is_global:
+        sys.stderr.write(f"Error: {host} is a local or private address. Links must point at a public site.\n")
+        sys.exit(1)
+    addrs.append(addr)
+addr = addrs[0]
+shown = f"[{addr}]" if addr.version == 6 else str(addr)
+print(f"{host}:{port}:{shown}")
+PY
+}
+
+# Download a link into a file. Redirects are followed one at a time so each
+# new host gets the same check.
+fetch_link() {
+	local url="$1"
+	local out="$2"
+	local hops=0 pin result code next status
+	local -a resolve reply
+	# The final response's Content-Disposition and address, for the version
+	# guess. stage_archive_pack reads them.
+	FETCH_DISPOSITION=""
+	FETCH_URL=""
+	while :; do
+		pin="$(link_target "$url")" || return 1
+		resolve=()
+		if [[ -n "$pin" ]]; then
+			resolve=(--resolve "$pin")
+		fi
+		status=0
+		result="$(curl_meter -f --proto =https --retry 2 --connect-timeout 20 --max-time 1800 \
+			--max-filesize "$PACK_MAX_DOWNLOAD" -A modman "${resolve[@]}" \
+			-o "$out" -w '%{http_code}\n%{redirect_url}\n%header{content-disposition}' "$url")" || status=$?
+		if ((status == 63)); then
+			echo "Error: the download is larger than $((PACK_MAX_DOWNLOAD / 1024 / 1024 / 1024)) GB." >&2
+			return 1
+		fi
+		if ((status != 0)); then
+			echo "Error: download failed." >&2
+			return 1
+		fi
+		mapfile -t reply <<<"$result"
+		code="${reply[0]:-}"
+		next="${reply[1]:-}"
+		if [[ "$code" != 3* ]]; then
+			FETCH_DISPOSITION="${reply[2]:-}"
+			FETCH_URL="$url"
+			return 0
+		fi
+		if [[ -z "$next" ]]; then
+			echo "Error: the link redirected without saying where." >&2
+			return 1
+		fi
+		hops=$((hops + 1))
+		if ((hops > 10)); then
+			echo "Error: the link redirected too many times." >&2
+			return 1
+		fi
+		url="$next"
+	done
+}
+
 # Unpack a server pack from a download link ("url") or a local zip ("file").
 # Prints workdir, pack root, and whether start.sh was generated, the same as
 # cf_stage_server_pack.
 stage_archive_pack() {
 	local kind="$1"
 	local src="$2"
-	local url work zip root generated="-" status=0
+	local url work zip root generated="-" status=0 sha
 
 	work="$(mktemp -d)"
 	if [[ "$kind" == "url" ]]; then
@@ -2774,9 +3257,8 @@ stage_archive_pack() {
 		fi
 		zip="${work}/pack.zip"
 		echo "Downloading the server pack..." >&2
-		if ! curl -fL --proto =https --proto-redir =https --retry 2 -A modman -o "$zip" -# "$url"; then
+		if ! fetch_link "$url" "$zip"; then
 			rm -rf "$work"
-			echo "Error: download failed." >&2
 			return 1
 		fi
 		if ! python3 -c 'import sys, zipfile; sys.exit(0 if zipfile.is_zipfile(sys.argv[1]) else 1)' "$zip"; then
@@ -2801,7 +3283,15 @@ stage_archive_pack() {
 			return 1
 		fi
 	fi
-	printf '%s\n%s\n%s\n' "$work" "$root" "$generated"
+	sha="$(sha256sum "$zip" 2>/dev/null)" || sha=""
+	# After the three lines cf_stage_server_pack also prints: the zip's hash,
+	# then the names the version guess looks at.
+	if [[ "$kind" == "url" ]]; then
+		printf '%s\n' "$work" "$root" "$generated" "${sha%% *}" \
+			"$(version_clean "${FETCH_DISPOSITION:-}")" "$(version_clean "${FETCH_URL:-}")"
+	else
+		printf '%s\n' "$work" "$root" "$generated" "${sha%% *}" "" "$(basename -- "$src")"
+	fi
 }
 
 # Looks up the newest server pack and compares it with the installed one.
@@ -2874,6 +3364,7 @@ update_modpack() {
 	local mod_id="" mod_name="" known_file="" known_version="" known_date=""
 	local file_id meta display versions answer release release_name release_date
 	local staged work root generated status=0
+	local new_version="" zip_sha="" hint_disposition="" hint_name=""
 	local was_running=0 keep_world=1 world_status=0
 
 	if [[ -z "$name" ]]; then
@@ -2894,8 +3385,11 @@ update_modpack() {
 		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
 		return 1
 	fi
-	# The webpage only updates from CurseForge.
-	if [[ "${MODMAN_YES:-}" != "1" ]]; then
+	# The webpage passes a link in MODMAN_UPDATE_LINK, or updates from CurseForge.
+	if [[ -n "${MODMAN_UPDATE_LINK:-}" ]]; then
+		source="url"
+		source_arg="$MODMAN_UPDATE_LINK"
+	elif [[ "${MODMAN_YES:-}" != "1" ]]; then
 		choice="$(update_prompt_source)" || select_status=$?
 		if ((select_status == 3)); then
 			return 0
@@ -2949,6 +3443,7 @@ update_modpack() {
 		fi
 
 		echo "Looking up the server pack for ${mod_name}..."
+		progress check
 		update_lookup "$key" "$mod_id" "$known_file" "$known_version" "$known_date" || return 1
 		file_id="$UPD_FILE"
 		release_name="$UPD_RELEASE_NAME"
@@ -3010,6 +3505,7 @@ update_modpack() {
 	fi
 
 	if ((was_running)); then
+		progress stop
 		stop_one "$name" || return 1
 	fi
 
@@ -3022,7 +3518,18 @@ update_modpack() {
 		IFS= read -r work
 		IFS= read -r root
 		IFS= read -r generated
+		IFS= read -r zip_sha
+		IFS= read -r hint_disposition
+		IFS= read -r hint_name
 	} <<<"$staged"
+	# Guess the version before the staged files go away.
+	if [[ "$source" == "curseforge" ]]; then
+		new_version="$(detect_pack_version "$root" "$release_name")"
+		new_version="${new_version:-${release_name:-$UPD_LATEST}}"
+	else
+		new_version="$(detect_pack_version "$root" "" "$hint_disposition" "$hint_name" "$source_arg")"
+	fi
+	progress install
 	if ! cf_replace_pack "$name" "$root" "$keep_world"; then
 		rm -rf "$work"
 		return 1
@@ -3038,6 +3545,11 @@ update_modpack() {
 	fi
 
 	echo "Updated '${name}' in ${dest}"
+	case "$source" in
+	curseforge) record_pack_version "$name" "$new_version" curseforge "$mod_id" ;;
+	url) record_pack_version "$name" "$new_version" link "$source_arg" "$zip_sha" ;;
+	*) record_pack_version "$name" "$new_version" zip "$(basename -- "$source_arg")" "$zip_sha" ;;
+	esac
 	if [[ "$generated" == "generated" ]]; then
 		echo "Wrote start.sh; the server pack did not include one."
 	elif [[ "$generated" == renamed\ * ]]; then
@@ -3201,7 +3713,7 @@ web_pack_row() {
 	local name="$3"
 	local need="${4:--}"
 	local usage="${5:-}"
-	local java port status cpu ram uptime curse=0
+	local java port status cpu ram uptime curse=0 version=""
 
 	java="$(get_java_version "$name")"
 	port="$(get_port "$name")"
@@ -3216,14 +3728,18 @@ web_pack_row() {
 		if [[ -f "$MINECRAFT_ROOT/$name/.curseforge-id" ]]; then
 			curse=1
 		fi
+		if pack_stays_inside "$name"; then
+			read_pack_version "$MINECRAFT_ROOT/$name"
+			version="$PV_VERSION"
+		fi
 	else
 		status="stopped"
 		cpu="-"
 		ram="-"
 		uptime="-"
 	fi
-	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
-		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" "$need" >>"$file"
+	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" "$need" "$version" >>"$file"
 }
 
 web_json_packs() {
@@ -3261,9 +3777,9 @@ rows = []
 with open(sys.argv[1], encoding="utf-8") as fh:
     for line in fh:
         parts = line.rstrip("\n").split("\x1f")
-        if len(parts) != 10:
+        if len(parts) != 11:
             continue
-        indexed, name, java, port, status, cpu, ram, uptime, curse, need = parts
+        indexed, name, java, port, status, cpu, ram, uptime, curse, need, version = parts
         rows.append({
             "indexed": indexed == "1",
             "name": name,
@@ -3275,6 +3791,7 @@ with open(sys.argv[1], encoding="utf-8") as fh:
             "uptime": uptime,
             "curseforge": curse == "1",
             "java_need": need,
+            "version": version,
         })
 print(json.dumps({
     "packs": rows,
@@ -3291,7 +3808,6 @@ PY
 web_show_log() {
 	local name="${1:-}"
 	local offset="${2:-0}"
-	local log size
 	require_modpack "$name" || return 1
 	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
 		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
@@ -3300,21 +3816,54 @@ web_show_log() {
 	if [[ ! "$offset" =~ ^[0-9]{1,18}$ ]]; then
 		offset=0
 	fi
-	log="$MINECRAFT_ROOT/$name/logs/latest.log"
-	if [[ ! -f "$log" ]]; then
-		printf 'MODMAN_LOG 1 0\nNo log yet.\n'
-		return 0
-	fi
-	size="$(stat -c '%s' "$log")"
-	if (( offset == 0 || offset > size )); then
-		printf 'MODMAN_LOG 1 %s\n' "$size"
-		head -c "$size" "$log" | tail -n 200
-		return 0
-	fi
-	printf 'MODMAN_LOG 0 %s\n' "$size"
-	if (( offset < size )); then
-		tail -c +$((offset + 1)) "$log" | head -c $((size - offset))
-	fi
+	# The server can replace its logs with a symlink to another file, or with
+	# something that never ends. Each step is opened without following links,
+	# and only a regular file is read.
+	python3 - "$MINECRAFT_ROOT/$name" "$offset" <<'PY'
+import errno, os, stat, sys
+
+pack, offset = sys.argv[1], int(sys.argv[2])
+out = sys.stdout.buffer
+TAIL_LINES = 200
+TAIL_BYTES = 4 << 20
+
+def frame(reset, size, body=b""):
+    out.write(f"MODMAN_LOG {reset} {size}\n".encode() + body)
+
+nofollow = os.O_RDONLY | os.O_NOFOLLOW
+try:
+    pack_fd = os.open(pack, nofollow | os.O_DIRECTORY)
+    logs_fd = os.open("logs", nofollow | os.O_DIRECTORY, dir_fd=pack_fd)
+    fd = os.open("latest.log", nofollow | os.O_NONBLOCK, dir_fd=logs_fd)
+except FileNotFoundError:
+    frame(1, 0, b"No log yet.\n")
+    sys.exit(0)
+except OSError as err:
+    if err.errno in (errno.ELOOP, errno.ENOTDIR):
+        frame(1, 0, b"The log is a symlink, so the page does not show it.\n")
+        sys.exit(0)
+    raise
+if not stat.S_ISREG(os.fstat(fd).st_mode):
+    frame(1, 0, b"The log is not a regular file, so the page does not show it.\n")
+    sys.exit(0)
+
+# offset 0, or one past the end, sends the last lines. Any other offset sends
+# only the bytes written after it.
+size = os.fstat(fd).st_size
+if offset == 0 or offset > size:
+    start = max(0, size - TAIL_BYTES)
+    data = os.pread(fd, size - start, start)
+    lines = data.splitlines(keepends=True)
+    frame(1, size, b"".join(lines[-TAIL_LINES:]))
+else:
+    body = b""
+    while offset + len(body) < size:
+        chunk = os.pread(fd, min(1 << 20, size - offset - len(body)), offset + len(body))
+        if not chunk:
+            break
+        body += chunk
+    frame(0, size, body)
+PY
 }
 
 # screen's stuff command treats ^ and \ as escapes. Quote those so a
@@ -3431,10 +3980,16 @@ web_update() {
 	local delete_confirm="${4:-}"
 	local mod_id="${5:-}"
 	local expect_file="${6:-}"
+	local link="${7:-}"
 	if ! valid_modpack_name "$name"; then
 		echo "Error: '$name' is not a modpack name." >&2
 		return 1
 	fi
+	# The webpage reads this file while the update runs.
+	local -x MODMAN_PROGRESS_FILE="${ROOT_DIR}/data/.update-progress-${name}"
+	progress start
+	# shellcheck disable=SC2064
+	trap "rm -f $(printf '%q' "$MODMAN_PROGRESS_FILE") $(printf '%q' "$MODMAN_PROGRESS_FILE.tmp")" RETURN
 	if [[ "$confirm" != "yes" ]]; then
 		echo "Error: type yes to update." >&2
 		return 1
@@ -3460,6 +4015,14 @@ web_update() {
 	if [[ -n "$expect_file" && ! "$expect_file" =~ ^[0-9]+$ ]]; then
 		echo "Error: bad CurseForge file id." >&2
 		return 1
+	fi
+	if [[ -n "$link" ]]; then
+		if [[ "$link" != https://* || "$link" =~ [[:space:][:cntrl:]] || ${#link} -gt 2048 ]]; then
+			echo "Error: the link must be one https:// address with no spaces." >&2
+			return 1
+		fi
+		MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_UPDATE_LINK="$link" update_modpack "$name"
+		return
 	fi
 	MODMAN_YES=1 MODMAN_WORLD="$world" MODMAN_MOD_ID="$mod_id" MODMAN_EXPECT_FILE="$expect_file" \
 		update_modpack "$name"
@@ -3543,6 +4106,9 @@ web_run() {
 	prop)
 		set_property "${1:-}" "${2:-}" "${3-}"
 		;;
+	version)
+		set_pack_version "${1:-}" "${2:-}"
+		;;
 	uninstall)
 		if ! valid_modpack_name "${1:-}"; then
 			echo "Error: '${1:-}' is not a modpack name." >&2
@@ -3583,7 +4149,7 @@ web_call() {
 	props) web_properties "${1:-}" ;;
 	search) web_search "${1:-}" ;;
 	install) web_install_modpack "${1:-}" ;;
-	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" ;;
 	updatecheck) web_update_check "${1:-}" "${2:-}" ;;
 	run) web_run "$@" ;;
 	*)
@@ -4328,6 +4894,9 @@ dispatch() {
 			require_arg "$cmd" "${1:-}" || return 1
 			edit_properties "$1" || return 1
 			;;
+		version)
+			pack_version_command "$@" || return 1
+			;;
 		web)
 			web_control "$@" || return 1
 			;;
@@ -4377,7 +4946,7 @@ _repl_candidates() {
 	local -a words=()
 
 	if ((cword == 0)); then
-		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port edit web help exit
+		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port edit version web help exit
 		return 0
 	fi
 
@@ -4410,7 +4979,7 @@ _repl_candidates() {
 				_ci_matches "$cur" ${words[@]+"${words[@]}"}
 			fi
 			;;
-		rename|mv|port|edit)
+		rename|mv|port|edit|version)
 			if ((cword == 1)); then
 				mapfile -t words < <(all_modpack_names || true)
 				_ci_matches "$cur" ${words[@]+"${words[@]}"}
@@ -4541,6 +5110,12 @@ if [[ "${1:-}" == "--web-call" ]]; then
 	shift
 	MODMAN_WEB_CALL=1
 	web_call "$@"
+	exit $?
+fi
+
+# mc-servers.service runs this at boot to start every indexed pack.
+if [[ "${1:-}" == "--boot" ]]; then
+	start_servers
 	exit $?
 fi
 
