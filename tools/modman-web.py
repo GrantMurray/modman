@@ -664,6 +664,8 @@ APP_PAGE = r"""<!DOCTYPE html>
   .props-menu input { margin: 0.2rem 0.2rem 0.35rem; }
   .props-menu .props-list { overflow-y: auto; max-height: 14rem; display: flex; flex-direction: column; }
   .props-menu .props-list button { display: flex; gap: 0.8rem; justify-content: space-between; }
+  /* display: flex above would otherwise beat the hidden attribute the filter sets. */
+  .props-menu .props-list button[hidden] { display: none; }
   .props-menu .props-val { color: var(--muted); overflow: hidden; text-overflow: ellipsis; max-width: 12rem; }
   .props-menu p { margin: 0.4rem 0.6rem; }
 
