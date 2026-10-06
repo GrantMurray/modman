@@ -3713,7 +3713,8 @@ web_pack_row() {
 	local name="$3"
 	local need="${4:--}"
 	local usage="${5:-}"
-	local java port status cpu ram uptime curse=0 version=""
+	local java port status cpu ram uptime curse=0
+	local version="" v_source="" v_from="" v_installed="" v_sha="" v_edited=""
 
 	java="$(get_java_version "$name")"
 	port="$(get_port "$name")"
@@ -3731,6 +3732,11 @@ web_pack_row() {
 		if pack_stays_inside "$name"; then
 			read_pack_version "$MINECRAFT_ROOT/$name"
 			version="$PV_VERSION"
+			v_source="$(version_clean "$PV_SOURCE")"
+			v_from="$(version_clean "$PV_FROM")"
+			v_installed="$(version_clean "$PV_INSTALLED")"
+			v_sha="$(version_clean "$PV_SHA")"
+			v_edited="$(version_clean "$PV_EDITED")"
 		fi
 	else
 		status="stopped"
@@ -3738,8 +3744,9 @@ web_pack_row() {
 		ram="-"
 		uptime="-"
 	fi
-	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
-		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" "$need" "$version" >>"$file"
+	printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+		"$indexed" "$name" "$java" "$port" "$status" "$cpu" "$ram" "$uptime" "$curse" "$need" \
+		"$version" "$v_source" "$v_from" "$v_installed" "$v_sha" "$v_edited" >>"$file"
 }
 
 web_json_packs() {
@@ -3777,9 +3784,10 @@ rows = []
 with open(sys.argv[1], encoding="utf-8") as fh:
     for line in fh:
         parts = line.rstrip("\n").split("\x1f")
-        if len(parts) != 11:
+        if len(parts) != 16:
             continue
-        indexed, name, java, port, status, cpu, ram, uptime, curse, need, version = parts
+        indexed, name, java, port, status, cpu, ram, uptime, curse, need, version = parts[:11]
+        v_source, v_from, v_installed, v_sha, v_edited = parts[11:]
         rows.append({
             "indexed": indexed == "1",
             "name": name,
@@ -3792,6 +3800,14 @@ with open(sys.argv[1], encoding="utf-8") as fh:
             "curseforge": curse == "1",
             "java_need": need,
             "version": version,
+            # What .modman-version saved, for the page's Version dialog.
+            "version_info": {
+                "source": v_source,
+                "from": v_from,
+                "installed": v_installed,
+                "sha256": v_sha,
+                "edited": v_edited,
+            },
         })
 print(json.dumps({
     "packs": rows,

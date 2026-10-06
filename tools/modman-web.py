@@ -688,6 +688,10 @@ APP_PAGE = r"""<!DOCTYPE html>
   .results button { display: block; width: 100%; text-align: left; padding: 0.55rem 0.75rem; }
   .results button.on { outline: 2px solid var(--accent); }
   .upd-check { padding: 0.5rem 0.7rem; background: var(--surface-2); border-left: 3px solid var(--idle); border-radius: 0 6px 6px 0; }
+  .ver-info { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.8rem; margin: 0 0 0.9rem; padding: 0.6rem 0.75rem; background: var(--surface-2); border-radius: 8px; font-size: 0.9rem; }
+  .ver-info dt { color: var(--muted); }
+  .ver-info dd { margin: 0; overflow-wrap: anywhere; }
+  .ver-info code { font: 0.82rem ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace; }
   .upd-source { display: flex; flex-wrap: wrap; gap: 0 1.2rem; }
   .upd-source label { margin: 0.3rem 0; }
   .upd-check.warn { border-left-color: var(--warn); color: var(--warn); }
@@ -1285,7 +1289,7 @@ function rowMenuItems(pack) {
     if (up && main !== "restart") items.push(["restart", "Restart"]);
     if (up && main !== "stop") items.push(["stop", "Stop"]);
   }
-  items.push(["props", "Properties…"], ["port", "Change port…"], ["version", "Set version…"], ["update", "Update…"]);
+  items.push(["props", "Properties…"], ["port", "Change port…"], ["version", "Version…"], ["update", "Update…"]);
   if (pack.indexed) items.push(["disable", "Disable (move to Installed)"]);
   items.push("-", ["uninstall", "Uninstall…"]);
   return items;
@@ -1905,22 +1909,59 @@ function askPort(name, current) {
   input.select();
 }
 
-// The version is guessed on each install and update. This types it by hand
-// until the next one.
-function askVersion(name, current) {
+// Shows what .modman-version saved for a pack, and lets the version be typed
+// by hand. The next install or update replaces a typed version.
+function versionDetails(pack) {
+  const info = (pack && pack.version_info) || {};
+  const rows = [];
+  const version = pack && pack.version
+    ? esc(pack.version) + (info.edited ? ' <span class="muted">(typed by hand)</span>' : "")
+    : '<span class="muted">unknown</span>';
+  rows.push(["Version", version]);
+  if (info.source === "curseforge") {
+    rows.push(["Source", "CurseForge" + (info.from ? ` project ${esc(info.from)}` : "")]);
+  } else if (info.source === "link") {
+    rows.push(["Source", "Download link"], ["Link", `<code>${esc(info.from)}</code>`]);
+  } else if (info.source === "zip") {
+    rows.push(["Source", "Zip file"], ["File", `<code>${esc(info.from)}</code>`]);
+  } else if (info.source) {
+    rows.push(["Source", esc(info.source)]);
+  }
+  const when = (iso) => {
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? esc(iso) : esc(d.toLocaleString());
+  };
+  if (info.installed) rows.push(["Installed", when(info.installed)]);
+  if (info.edited) rows.push(["Typed", when(info.edited)]);
+  if (info.sha256) rows.push(["SHA-256", `<code>${esc(info.sha256)}</code>`]);
+  return `<dl class="ver-info">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+}
+
+function askVersion(name, pack) {
+  const current = (pack && pack.version) || "";
+  const note = pack && (pack.version || (pack.version_info && pack.version_info.source))
+    ? ""
+    : '<p class="muted">No version is saved for this server yet. The next install or update guesses one, or type it here.</p>';
   ask(`<form>
-    <p>Set the version shown for <strong>${esc(name)}</strong>. The next install or update replaces it.</p>
-    <label>Version <input type="text" name="version" maxlength="64" value="${esc(current)}" placeholder="2.5.0" autocomplete="off" spellcheck="false" required></label>
-    <div class="row-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Save</button></div>
+    <p>Version of <strong>${esc(name)}</strong></p>
+    ${versionDetails(pack)}
+    ${note}
+    <label>Change the version <input type="text" name="version" maxlength="64" value="${esc(current)}" placeholder="2.5.0" autocomplete="off" spellcheck="false" required></label>
+    <p class="muted">A typed version stays until the next install or update.</p>
+    <div class="row-actions"><button type="button" data-cancel>Close</button><button type="submit" id="ver-save" disabled>Save</button></div>
   </form>`, (fields) => {
     const version = String(fields.version || "").trim();
-    if (!version) return;
+    if (!version || version === current) return;
     dlg.close();
     run({cmd: "version", name, version}, `Setting ${name} version to ${version}…`);
   });
+  // Save turns on once the field holds a new version.
   const input = dlg.querySelector("[name=version]");
-  input.focus();
-  input.select();
+  const save = dlg.querySelector("#ver-save");
+  input.oninput = () => {
+    const value = input.value.trim();
+    save.disabled = !value || value === current;
+  };
 }
 
 // anchor is the button the action came from, which a menu it opens hangs off.
@@ -1933,7 +1974,7 @@ async function rowAction(act, name, anchor) {
     return;
   }
   if (act === "version") {
-    askVersion(name, (pack && pack.version) || "");
+    askVersion(name, pack);
     return;
   }
   if (act === "props") {
