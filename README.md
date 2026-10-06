@@ -142,6 +142,8 @@ Each server runs in a sandbox, because `start.sh` and the jars come from whoever
 
 When `start.sh` does not name a `java` program, modman reads `JAVA=` from `variables.txt` and uses that path for the Java version column.
 
+`java MyPack` shows which Java the pack runs and which one its Minecraft version needs, then lists the installed Javas to pick from. Choosing one rewrites every `java` command in `start.sh` and in Forge's `run.sh`, and the `JAVA=` line in `variables.txt`. Only Javas root installed under `/usr/lib/jvm`, or the system `java`, can be chosen. A running server picks up the change when it restarts.
+
 The server creates `logs/latest.log` once it has started. modman reads that log to tell **starting**, **running**, and **error** apart. Right after a start, the log left from the last run is ignored until the new server writes to it, so a server shows **starting** rather than **running** while it loads.
 
 `data/index.txt` is the list of folder names modman manages together. One name per line. The name must match a folder under `/srv/minecraft`. Blank lines are skipped. `enable` and `disable` edit this file for you.
@@ -220,7 +222,7 @@ These commands talk to `mc-servers.service`, the service that starts the indexed
 
 The page lists every modpack in two groups. **Active** holds the enabled servers, with their status, CPU, memory, and uptime. **Installed** holds the rest. Click the Installed heading to fold that list away. It starts folded on a phone, and the page remembers your choice in that browser.
 
-Each server has one main button for what you most likely want next: **Start** for a stopped server, **Stop** for a running one, **Restart** for one that hit an error, and **Enable** for an installed one. Beside it, **Log** shows that server's console, and **⋯** opens the rest: Restart, Properties… for `server.properties`, Change port…, Version…, Update…, Disable, and Uninstall…. A server's details line shows its version when one is known. Version… shows what modman saved about the installed pack (version, source, link or file, install time, and SHA-256) and lets you type a different version. Start, stop, and restart are only offered for enabled servers, so a one-off test of an installed server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running.
+Each server has one main button for what you most likely want next: **Start** for a stopped server, **Stop** for a running one, **Restart** for one that hit an error, and **Enable** for an installed one. Beside it, **Log** shows that server's console, and **⋯** opens the rest: Restart, Properties… for `server.properties`, Change port…, Version…, Java…, Update…, Disable, and Uninstall…. A server's details line shows its version when one is known. Version… shows what modman saved about the installed pack (version, source, link or file, install time, and SHA-256) and lets you type a different version. Java… does what `java MyPack` does: it lists the installed Javas, marks the one the server runs and any that do not suit its Minecraft version, and saves the one you pick. Start, stop, and restart are only offered for enabled servers, so a one-off test of an installed server is done from the prompt. A server started from the page runs in your user service, so restarting the page leaves it running.
 
 The result of an action, such as stopping a modpack, shows as a note in the bottom corner. A note for an action that worked fades after a few seconds. An error stays until you close it. **Install modpack** opens a CurseForge search in its own window.
 
@@ -322,6 +324,7 @@ Each install and update also writes `.modman-version` in the folder, with the pa
 | `rename MyPack MyPack2` | Renames the folder and updates the index if that server was listed |
 | `port MyPack 25570` | Sets that server's port in `server.properties` |
 | `version` / `version MyPack` / `version MyPack 2.5.0` | Lists every pack's version, shows one pack's details, or types a pack's version by hand |
+| `java` / `java MyPack` / `java MyPack 3` | Lists the Javas installed in `/usr/lib/jvm`, or shows which one a pack runs and lets you pick another by number, by path, or `default` for the system's `java` |
 
 `port` works whether or not the server is in the index. The new port is used the next time that server starts.
 

@@ -72,6 +72,7 @@ Commands:
   port MODPACK PORT          Set a modpack's server-port in server.properties
   edit MODPACK               List server.properties values and change one
   version [MODPACK [VERSION]] Show every pack's version, one pack's details, or type a pack's version
+  java [MODPACK [CHOICE]]    List installed Javas, or choose the one a pack runs (a number, a path, or default)
   web start                  Start https and http with the saved password
   web stop                   Stop the control page
   web restart                Stop the page, then start it again
@@ -112,6 +113,9 @@ Examples:
   edit Linggango-HugeUpdate
   version
   version Cobbleverse 2.5.0
+  java
+  java Fantasia
+  java Cobbleverse 4
   web start
   web status
   web stop
@@ -239,6 +243,14 @@ get_java_version() {
 		fi
 		bin="$real"
 	fi
+	java_major "$bin"
+}
+
+# Major version of a java program root installed (8, 17, 21, …), or "-".
+# Callers check the program first, since this runs it.
+java_major() {
+	local bin="$1"
+	local version major
 
 	if [[ ! -v JAVA_VERSION_CACHE ]]; then
 		declare -gA JAVA_VERSION_CACHE=()
@@ -261,6 +273,267 @@ get_java_version() {
 	fi
 	JAVA_VERSION_CACHE["$bin"]="$major"
 	printf '%s' "$major"
+}
+
+# Java installs root put in /usr/lib/jvm, one per real folder (default-java
+# and the java-1.N names are links to the same ones). Prints
+# "major<TAB>path to bin/java", oldest Java first.
+installed_javas() {
+	local dir bin real
+	local -A seen=()
+	for dir in /usr/lib/jvm/*/; do
+		bin="${dir}bin/java"
+		[[ -x "$bin" ]] || bin="${dir}jre/bin/java"
+		[[ -x "$bin" ]] || continue
+		real="$(realpath -e -- "$bin" 2>/dev/null)" || continue
+		[[ -z "${seen[$real]:-}" ]] || continue
+		seen["$real"]=1
+		[[ "$(stat -c %u -- "$real" 2>/dev/null)" == "0" ]] || continue
+		printf '%s\t%s\n' "$(java_major "$real")" "$real"
+	done | sort -t $'\t' -k1,1n -k2,2
+}
+
+# Note for the java list when Java HAVE cannot run a pack that needs NEED.
+java_fit_note() {
+	if ! java_fits "$1" "$2"; then
+		if [[ "$1" == "8" ]]; then
+			printf '  - this pack needs Java 8'
+		else
+			printf '  - too old for this pack'
+		fi
+	fi
+}
+
+# True when Java HAVE can run a pack that needs NEED. Before Minecraft 1.17
+# that is Java 8 exactly; after it, NEED or newer.
+java_fits() {
+	local need="$1"
+	local have="$2"
+	[[ "$need" =~ ^[0-9]+$ && "$have" =~ ^[0-9]+$ ]] || return 0
+	if ((need == 8)); then
+		((have == 8))
+	else
+		((have >= need))
+	fi
+}
+
+# java: list the Java installs. java MODPACK: show what the pack runs, then
+# pick from the list. java MODPACK CHOICE: set it, where CHOICE is a number
+# from the list, a path from it, or default (the system's java command).
+java_command() {
+	local name="${1:-}"
+	local choice="${2:-}"
+	local -a majors=() paths=()
+	local major path i current have need="-" default_major mark
+	while IFS=$'\t' read -r major path; do
+		majors+=("$major")
+		paths+=("$path")
+	done < <(installed_javas)
+	default_major="-"
+	if command -v java >/dev/null 2>&1; then
+		default_major="$(java_major java)"
+	fi
+
+	if [[ -z "$name" ]]; then
+		if ((${#paths[@]} == 0)); then
+			echo "No Java found in /usr/lib/jvm."
+		fi
+		printf '  default  java, the system default (Java %s)\n' "$default_major"
+		for i in "${!paths[@]}"; do
+			printf '  %2d)  Java %-3s  %s\n' "$((i + 1))" "${majors[$i]}" "${paths[$i]}"
+		done
+		return 0
+	fi
+
+	require_modpack "$name" || return 1
+	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	current="$(java_bin_for "$name")"
+	have="$(get_java_version "$name")"
+	need="$(packs_required_java "$name" 2>/dev/null | cut -f2)" || need="-"
+	need="${need:--}"
+
+	if [[ -z "$choice" ]]; then
+		echo "'${name}' runs: ${current:-no java command found} (Java ${have})"
+		if [[ "$need" == "8" ]]; then
+			echo "Its Minecraft version needs Java 8."
+		elif [[ "$need" =~ ^[0-9]+$ ]]; then
+			echo "Its Minecraft version needs Java ${need} or newer."
+		fi
+		echo "Installed:"
+		mark=" "
+		[[ "$current" == "java" ]] && mark="*"
+		printf ' %s default  java, the system default (Java %s)%s\n' "$mark" "$default_major" \
+			"$(java_fit_note "$need" "$default_major")"
+		for i in "${!paths[@]}"; do
+			mark=" "
+			[[ "$current" == /* && "$(realpath -e -- "$current" 2>/dev/null)" == "${paths[$i]}" ]] && mark="*"
+			printf ' %s %2d)  Java %-3s  %s%s\n' "$mark" "$((i + 1))" "${majors[$i]}" "${paths[$i]}" \
+				"$(java_fit_note "$need" "${majors[$i]}")"
+		done
+		if ! read -r -e -p "Number or default, or press Enter to cancel: " choice; then
+			echo
+			return 1
+		fi
+		choice="${choice//[[:space:]]/}"
+		if [[ -z "$choice" ]]; then
+			echo "Cancelled."
+			return 0
+		fi
+	fi
+
+	path=""
+	major="-"
+	if [[ "${choice,,}" == "default" || "$choice" == "java" ]]; then
+		path="java"
+		major="$default_major"
+	elif [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#paths[@]})); then
+		path="${paths[$((choice - 1))]}"
+		major="${majors[$((choice - 1))]}"
+	elif [[ "$choice" == /* ]]; then
+		for i in "${!paths[@]}"; do
+			if [[ "$(realpath -m -- "$choice")" == "${paths[$i]}" ]]; then
+				path="${paths[$i]}"
+				major="${majors[$i]}"
+			fi
+		done
+	fi
+	if [[ -z "$path" ]]; then
+		echo "Error: '$choice' is not one of the installed Javas. Run java to list them." >&2
+		return 1
+	fi
+	if ! java_fits "$need" "$major"; then
+		echo "Warning: ${name} needs Java ${need}$([[ "$need" == 8 ]] || echo " or newer"), and this is Java ${major}. The server may not start." >&2
+	fi
+	set_pack_java "$name" "$path" "$major"
+}
+
+# JSON for the webpage's Java dialog: the Java the pack runs, the one its
+# Minecraft version needs, and the installed ones it can choose.
+web_java_info() {
+	local name="${1:-}"
+	local current need default_major="-"
+	require_modpack "$name" || return 1
+	if [[ ! -d "$MINECRAFT_ROOT/$name" ]]; then
+		echo "Error: '$name' not found under $MINECRAFT_ROOT" >&2
+		return 1
+	fi
+	current="$(java_bin_for "$name")"
+	if [[ "$current" == /* ]]; then
+		current="$(realpath -m -- "$current")"
+	fi
+	need="$(packs_required_java "$name" 2>/dev/null | cut -f2)" || need="-"
+	if command -v java >/dev/null 2>&1; then
+		default_major="$(java_major java)"
+	fi
+	{
+		printf '%s\t%s\t%s\t%s\n' "$current" "${need:--}" "$default_major" "$(get_java_version "$name")"
+		installed_javas
+	} | python3 -c 'import json, sys
+lines = sys.stdin.read().splitlines()
+current, need, default_major, running = (lines[0].split("\t") + ["", "", "", ""])[:4]
+javas = []
+for line in lines[1:]:
+    major, _, path = line.partition("\t")
+    if path:
+        javas.append({"major": major, "path": path})
+print(json.dumps({"ok": True, "current": current, "need": need, "running": running,
+                  "default_major": default_major, "javas": javas}))'
+}
+
+# Point every place a pack starts Java at BIN: java lines in start.sh and
+# Forge's run.sh, and JAVA= in variables.txt.
+set_pack_java() {
+	local name="$1"
+	local bin="$2"
+	local major="${3:--}"
+	local pack_dir="$MINECRAFT_ROOT/$name"
+	local work changed status=0 file mode
+	work="$(mktemp -d)"
+	# Files are opened without following links, since the server can write
+	# its own folder. Each changed file is staged in WORK.
+	changed="$(python3 - "$pack_dir" "$bin" "$work" <<'PY'
+import os, re, stat, sys
+
+pack, new, work = sys.argv[1:4]
+token = new if re.fullmatch(r"[A-Za-z0-9_./+-]+", new) else "'" + new.replace("'", "'\\''") + "'"
+LAUNCH = re.compile(r"""^(\s*(?:exec\s+)?)(["']?)(java|/[^\s'"]*/java)\2(?=\s|$)""")
+VAR = re.compile(r"""^(\s*JAVA\s*=\s*)(.*?)(\r?\n?)$""")
+
+def read(name):
+    try:
+        fd = os.open(os.path.join(pack, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        sys.stderr.write(f"Error: {name} is a symlink, so modman will not change it.\n")
+        sys.exit(1)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        sys.stderr.write(f"Error: {name} is not a regular file, so modman will not change it.\n")
+        sys.exit(1)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read().decode("utf-8", "surrogateescape")
+
+found = False
+for name in ("start.sh", "run.sh", "variables.txt"):
+    text = read(name)
+    if text is None:
+        continue
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        if name == "variables.txt":
+            m = VAR.match(line)
+            if m:
+                found = True
+                lines[i] = f'{m.group(1)}"{new}"{m.group(3)}'
+        else:
+            m = LAUNCH.match(line)
+            if m:
+                found = True
+                lines[i] = m.group(1) + token + line[m.end():]
+    out = "".join(lines)
+    if out != text:
+        with open(os.path.join(work, name), "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+            fh.write(out)
+        print(name)
+if not found:
+    sys.exit(2)
+PY
+)" || status=$?
+	if ((status == 2)); then
+		rm -rf "$work"
+		echo "Error: cannot find where '${name}' starts Java. start.sh and run.sh have no java command, and variables.txt has no JAVA= line." >&2
+		return 1
+	fi
+	if ((status != 0)); then
+		rm -rf "$work"
+		return 1
+	fi
+	if [[ -z "$changed" ]]; then
+		rm -rf "$work"
+		echo "'${name}' already uses ${bin}."
+		return 0
+	fi
+	while IFS= read -r file; do
+		mode=644
+		[[ "$file" == *.sh ]] && mode=755
+		if ! pack_file_write "$pack_dir" "$file" "$mode" <"$work/$file"; then
+			rm -rf "$work"
+			echo "Error: failed to write $pack_dir/$file" >&2
+			return 1
+		fi
+		echo "Updated $file"
+	done <<<"$changed"
+	rm -rf "$work"
+	echo "'${name}' now runs ${bin} (Java ${major})."
+	if is_running "$name"; then
+		echo "Restart ${name} for the change to take effect."
+	fi
 }
 
 screen_name() {
@@ -736,16 +1009,17 @@ pack_stays_inside() {
 	return 0
 }
 
-# Write stdin to FILE in a pack folder. The server can write its own folder
-# and could leave a symlink under that name, pointing at a file of yours. So
-# this writes a new file and renames it over the name, which replaces a link
-# instead of following it.
+# Write stdin to FILE in a pack folder, with MODE (644 unless given). The
+# server can write its own folder and could leave a symlink under that name,
+# pointing at a file of yours. So this writes a new file and renames it over
+# the name, which replaces a link instead of following it.
 pack_file_write() {
 	local pack_dir="$1"
 	local file="$2"
+	local mode="${3:-644}"
 	local tmp
 	tmp="$(mktemp "$pack_dir/.${file#.}.XXXXXX")" || return 1
-	if ! cat >"$tmp" || ! chmod 644 "$tmp" || ! mv -f -T "$tmp" "$pack_dir/$file"; then
+	if ! cat >"$tmp" || ! chmod "$mode" "$tmp" || ! mv -f -T "$tmp" "$pack_dir/$file"; then
 		rm -f "$tmp"
 		return 1
 	fi
@@ -4143,6 +4417,14 @@ web_run() {
 	version)
 		set_pack_version "${1:-}" "${2:-}"
 		;;
+	java)
+		# The page always sends its choice, so this never stops to ask.
+		if [[ -z "${2:-}" ]]; then
+			echo "Error: choose a Java." >&2
+			return 1
+		fi
+		java_command "${1:-}" "$2"
+		;;
 	uninstall)
 		if ! valid_modpack_name "${1:-}"; then
 			echo "Error: '${1:-}' is not a modpack name." >&2
@@ -4181,6 +4463,7 @@ web_call() {
 	root) printf '%s\n' "$MINECRAFT_ROOT" ;;
 	command) web_send_command "${1:-}" "${2:-}" ;;
 	props) web_properties "${1:-}" ;;
+	javainfo) web_java_info "${1:-}" ;;
 	search) web_search "${1:-}" ;;
 	install) web_install_modpack "${1:-}" ;;
 	update) web_update "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" ;;
@@ -4931,6 +5214,9 @@ dispatch() {
 		version)
 			pack_version_command "$@" || return 1
 			;;
+		java)
+			java_command "$@" || return 1
+			;;
 		web)
 			web_control "$@" || return 1
 			;;
@@ -4980,7 +5266,7 @@ _repl_candidates() {
 	local -a words=()
 
 	if ((cword == 0)); then
-		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port edit version web help exit
+		_ci_matches "$cur" list status usage start stop restart join service install update enable disable uninstall rename mv port edit version java web help exit
 		return 0
 	fi
 
@@ -5013,7 +5299,7 @@ _repl_candidates() {
 				_ci_matches "$cur" ${words[@]+"${words[@]}"}
 			fi
 			;;
-		rename|mv|port|edit|version)
+		rename|mv|port|edit|version|java)
 			if ((cword == 1)); then
 				mapfile -t words < <(all_modpack_names || true)
 				_ci_matches "$cur" ${words[@]+"${words[@]}"}

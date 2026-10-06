@@ -688,6 +688,11 @@ APP_PAGE = r"""<!DOCTYPE html>
   .results button { display: block; width: 100%; text-align: left; padding: 0.55rem 0.75rem; }
   .results button.on { outline: 2px solid var(--accent); }
   .upd-check { padding: 0.5rem 0.7rem; background: var(--surface-2); border-left: 3px solid var(--idle); border-radius: 0 6px 6px 0; }
+  .java-list { display: flex; flex-direction: column; gap: 0.15rem; margin: 0 0 0.75rem; }
+  .java-list label { display: flex; align-items: baseline; gap: 0.5rem; margin: 0; padding: 0.4rem 0.5rem; border-radius: 6px; }
+  .java-list label:hover { background: var(--hover); }
+  .java-list .java-path { color: var(--muted); font-size: 0.8rem; overflow-wrap: anywhere; }
+  .java-list .warn-text { font-size: 0.8rem; }
   .ver-info { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.8rem; margin: 0 0 0.9rem; padding: 0.6rem 0.75rem; background: var(--surface-2); border-radius: 8px; font-size: 0.9rem; }
   .ver-info dt { color: var(--muted); }
   .ver-info dd { margin: 0; overflow-wrap: anywhere; }
@@ -889,7 +894,7 @@ function esc(s) {
 const API_TIMEOUTS = {
   "/api/run": 180, "/api/packs": 120, "/api/log": 30, "/api/command": 30,
   "/api/search": 60, "/api/install": 3600, "/api/update": 3600,
-  "/api/props": 30, "/api/update-check": 90,
+  "/api/props": 30, "/api/update-check": 90, "/api/java": 30,
 };
 const API_MARGIN = 15;
 
@@ -1236,7 +1241,8 @@ function askEula(payload, label) {
 
 function ask(html, onok) {
   dlg.innerHTML = html;
-  dlg.showModal();
+  // A dialog that loads its content first, like Java…, is already open.
+  if (!dlg.open) dlg.showModal();
   dlg.querySelector("[data-cancel]").onclick = () => dlg.close();
   dlg.querySelector("form").onsubmit = (ev) => {
     ev.preventDefault();
@@ -1319,7 +1325,7 @@ function rowMenuItems(pack) {
     if (up && main !== "restart") items.push(["restart", "Restart"]);
     if (up && main !== "stop") items.push(["stop", "Stop"]);
   }
-  items.push(["props", "Properties…"], ["port", "Change port…"], ["version", "Version…"], ["update", "Update…"]);
+  items.push(["props", "Properties…"], ["port", "Change port…"], ["version", "Version…"], ["java", "Java…"], ["update", "Update…"]);
   if (pack.indexed) items.push(["disable", "Disable (move to Installed)"]);
   items.push("-", ["uninstall", "Uninstall…"]);
   return items;
@@ -1994,6 +2000,73 @@ function askVersion(name, pack) {
   };
 }
 
+// Java a pack can run: before Minecraft 1.17 that is Java 8 exactly, after it
+// the needed version or newer. Same rule as javaWarning.
+function javaFitNote(need, have) {
+  const n = Number(need), h = Number(have);
+  if (!Number.isFinite(n) || !Number.isFinite(h)) return "";
+  if (n === 8) return h === 8 ? "" : "This pack needs Java 8";
+  return h >= n ? "" : "Too old for this pack";
+}
+
+// Shows the Java a pack runs and lets another installed one be chosen.
+async function askJava(name) {
+  ask(`<form><p>Java for <strong>${esc(name)}</strong></p><p class="muted">Looking up the installed Javas…</p>
+    <div class="row-actions"><button type="button" data-cancel>Close</button></div></form>`, () => {});
+  let data;
+  try {
+    data = await api(`/api/java?name=${encodeURIComponent(name)}`);
+  } catch (err) {
+    data = {ok: false, output: err instanceof ApiTimeout ? err.message : "The page could not reach the server."};
+  }
+  if (!dlg.open || !data) return;
+  if (!data.ok) {
+    dlg.querySelector(".muted").textContent = data.output || "Could not look up Java.";
+    return;
+  }
+  const need = data.need;
+  const needText = need === "8" ? "Its Minecraft version needs Java 8."
+    : /^\d+$/.test(need) ? `Its Minecraft version needs Java ${need} or newer.` : "";
+  const current = data.current === "java" ? "default" : data.current;
+  const option = (value, title, detail, major) => {
+    const note = javaFitNote(need, major);
+    return `<label><input type="radio" name="choice" value="${esc(value)}"${value === current ? " checked" : ""}>
+      <span><strong>${esc(title)}</strong>${value === current ? " (now)" : ""}<br>
+      <span class="java-path">${esc(detail)}</span>${note ? `<br><span class="warn-text">${esc(note)}</span>` : ""}</span></label>`;
+  };
+  const options = [option("default", `Default (Java ${data.default_major})`, "java, the system default", data.default_major)]
+    .concat(data.javas.map((j) => option(j.path, `Java ${j.major}`, j.path, j.major)));
+  const runs = data.current
+    ? `Runs Java ${data.running}${data.current === "java" ? ", the system default" : ""}.`
+    : "No java command found in start.sh, run.sh, or variables.txt.";
+  ask(`<form>
+    <p>Java for <strong>${esc(name)}</strong></p>
+    <p class="muted">${esc(runs)} ${esc(needText)}</p>
+    <div class="java-list" role="radiogroup" aria-label="Installed Java">${options.join("")}</div>
+    <p class="muted">This changes the java commands in start.sh and run.sh, and JAVA= in variables.txt. A running server picks it up when it restarts.</p>
+    <p id="java-msg" class="warn-text"></p>
+    <div class="row-actions"><button type="button" data-cancel>Close</button><button type="submit" id="java-save" disabled>Save</button></div>
+  </form>`, (fields) => {
+    const choice = fields.choice || "";
+    if (!choice || choice === current) return;
+    dlg.close();
+    const label = choice === "default" ? "the default Java" : choice;
+    run({cmd: "java", name, choice}, `Setting ${name} to ${label}…`);
+  });
+  // Save turns on for a different choice, and warns before a poor fit.
+  const save = dlg.querySelector("#java-save");
+  const msg = dlg.querySelector("#java-msg");
+  dlg.querySelectorAll('input[name="choice"]').forEach((el) => {
+    el.onchange = () => {
+      save.disabled = el.value === current;
+      const pick = el.value === "default" ? data.default_major
+        : (data.javas.find((j) => j.path === el.value) || {}).major;
+      const note = javaFitNote(need, pick);
+      msg.textContent = note ? `${note}. The server may not start with it.` : "";
+    };
+  });
+}
+
 // anchor is the button the action came from, which a menu it opens hangs off.
 async function rowAction(act, name, anchor) {
   if (rowBusy) return;
@@ -2005,6 +2078,10 @@ async function rowAction(act, name, anchor) {
   }
   if (act === "version") {
     askVersion(name, pack);
+    return;
+  }
+  if (act === "java") {
+    askJava(name);
     return;
   }
   if (act === "props") {
@@ -2787,6 +2864,10 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query or "")
             self.handle_props((query.get("name") or [""])[0])
             return
+        if parsed.path == "/api/java":
+            query = parse_qs(parsed.query or "")
+            self.handle_java((query.get("name") or [""])[0])
+            return
         if parsed.path == "/api/update-progress":
             query = parse_qs(parsed.query or "")
             self.handle_update_progress((query.get("name") or [""])[0])
@@ -2970,6 +3051,22 @@ class Handler(BaseHTTPRequestHandler):
             text = ""
         self.send_json(200, {"ok": True, "text": text})
 
+    def handle_java(self, name):
+        try:
+            proc = modman_call(["javainfo", name], 30)
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {"ok": False, "output": "Timed out looking up Java."})
+            return
+        if proc.returncode != 0:
+            self.send_json(400, {"ok": False, "output": command_text(proc)})
+            return
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            self.send_json(500, {"ok": False, "output": command_text(proc)})
+            return
+        self.send_json(200, data)
+
     def handle_props(self, name):
         try:
             proc = modman_call(["props", name], 30)
@@ -3046,6 +3143,8 @@ class Handler(BaseHTTPRequestHandler):
             args.extend([name, str(body.get("key") or ""), str(body.get("value") or "")])
         elif cmd == "version":
             args.extend([name, str(body.get("version") or "")])
+        elif cmd == "java":
+            args.extend([name, str(body.get("choice") or "")])
         elif cmd == "uninstall":
             args.extend([name, str(body.get("confirm") or "")])
         elif cmd == "service":
